@@ -623,7 +623,8 @@ impl Connection {
                 // We need to send 1 more datagram and extend the buffer for that.
 
                 // Is 1 more datagram allowed?
-                if buf_capacity >= segment_size * max_datagrams {
+                // max_datagrams is clamped to at most MAX_TRANSMIT_SEGMENTS (10).
+                if num_datagrams >= max_datagrams as u64 {
                     // No more datagrams allowed
                     break;
                 }

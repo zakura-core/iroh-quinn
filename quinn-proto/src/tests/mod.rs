@@ -1780,6 +1780,35 @@ fn congested_tail_loss() {
     pair.client_send(client_ch, s).write(&[42; 1024]).unwrap();
 }
 
+// A short loss probe must not allow an extra datagram when GSO is disabled.
+#[test]
+fn tail_loss_respect_max_datagrams() {
+    let _guard = subscribe();
+    let mut client_config = client_config();
+    let mut transport = TransportConfig::default();
+    transport.enable_segmentation_offload(false);
+    client_config.transport_config(transport.into());
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(client_config);
+
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    assert!(!pair.server.inbound.is_empty());
+    pair.server.inbound.clear();
+
+    // Advance to the probe timeout, then queue enough data for a batch.
+    pair.step();
+    for _ in 0..5 {
+        pair.client_datagrams(client_ch)
+            .send(vec![0; 1000].into(), false)
+            .unwrap();
+    }
+    pair.drive();
+
+    let stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(stats.udp_tx.ios, stats.udp_tx.datagrams);
+}
+
 #[test]
 fn datagram_send_recv() {
     let _guard = subscribe();
