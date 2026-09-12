@@ -311,7 +311,7 @@ impl Endpoint {
         // Update connection socket references
         for sender in inner.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.create_sender()));
+            sender.send(ConnectionEvent::Rebind(inner.socket.create_sender()));
         }
         if let Some(driver) = inner.driver.take() {
             // Ensure the driver can register for wake-ups from the new socket
@@ -339,7 +339,7 @@ impl Endpoint {
         let mut inner = self.inner.state.lock().unwrap();
         for sender in inner.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::LocalAddressChanged(hint.clone()));
+            sender.send(ConnectionEvent::LocalAddressChanged(hint.clone()));
         }
         if let Some(driver) = inner.driver.take() {
             driver.wake();
@@ -379,7 +379,7 @@ impl Endpoint {
         endpoint.recv_state.connections.close = Some((error_code, reason.clone()));
         for sender in endpoint.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Close {
+            sender.send(ConnectionEvent::Close {
                 error_code,
                 reason: reason.clone(),
             });
@@ -685,8 +685,7 @@ impl State {
                 continue;
             };
             // Ignoring errors from dropped connections that haven't yet been cleaned up
-            let _ = self
-                .recv_state
+            self.recv_state
                 .connections
                 .senders
                 .get_mut(&ch)
@@ -838,8 +837,9 @@ struct ConnectionEventSender {
 }
 
 impl ConnectionEventSender {
-    fn send(&self, event: ConnectionEvent) -> Result<(), mpsc::error::SendError<ConnectionEvent>> {
-        self.control.send(event)
+    /// Discard events for dropped connections while endpoint cleanup catches up.
+    fn send(&self, event: ConnectionEvent) {
+        let _ = self.control.send(event);
     }
 
     fn try_send_datagram(&self, event: proto::ConnectionEvent) {
