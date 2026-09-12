@@ -413,6 +413,211 @@ fn export_keying_material() {
 }
 
 #[test]
+fn send_buffer_range_exhaustion_is_a_local_connection_failure() {
+    let _guard = subscribe();
+    for overflow_acks in [true, false] {
+        let mut transport = TransportConfig::default();
+        transport
+            .bounded_send_buffers(true)
+            .send_buffer_range_limit(NonZeroUsize::new(2))
+            .enable_segmentation_offload(false)
+            .packet_threshold(if overflow_acks { u32::MAX } else { 1 });
+        let mut pair = ConnPair::builder().with_transport_cfg(transport).connect();
+        let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+        for offset in 0..6u8 {
+            assert_eq!(pair.send_stream(Client, stream).write(&[offset]), Ok(1));
+            pair.drive_client();
+            if (offset % 2 == 0) == overflow_acks {
+                assert!(pair.server.inbound.pop_last().is_some());
+            }
+        }
+        if !overflow_acks {
+            // A later acknowledged packet makes all three gaps eligible for loss detection.
+            let other = pair.streams(Client).open(Dir::Uni).unwrap();
+            pair.send_stream(Client, other).write(b"advance").unwrap();
+            pair.drive_client();
+        }
+        pair.drive_server();
+        pair.drive_client();
+        assert_matches!(pair.conn_mut(Client).poll(), Some(Event::ConnectionLost {
+            reason: ConnectionError::TransportError(error),
+        }) if error.code == TransportErrorCode::INTERNAL_ERROR && error.reason == "send buffer range memory limit");
+    }
+}
+
+#[test]
+fn send_buffer_range_limit_preserves_repeated_delivery_with_loss() {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport
+        .bounded_send_buffers(true)
+        .send_buffer_range_limit(NonZeroUsize::new(2));
+    let mut pair = ConnPair::builder().with_transport_cfg(transport).connect();
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    for round in 0..128u8 {
+        let expected = vec![round; 4096];
+        assert_eq!(
+            pair.send_stream(Client, stream).write(&expected),
+            Ok(expected.len())
+        );
+        if round % 16 == 0 {
+            pair.drive_client();
+            assert!(pair.server.inbound.pop_last().is_some());
+        }
+        assert!(!pair.drive_bounded(1000));
+        let mut recv = pair.recv_stream(Server, stream);
+        let mut chunks = recv.read(true).unwrap();
+        let mut actual = Vec::new();
+        loop {
+            match chunks.next(usize::MAX) {
+                Ok(Some(chunk)) => actual.extend_from_slice(&chunk.bytes),
+                Err(ReadError::Blocked) => break,
+                other => panic!("stream must remain open between transfers: {other:?}"),
+            }
+        }
+        let _ = chunks.finalize();
+        assert_eq!(actual, expected);
+        assert!(!pair.conn(Client).is_closed());
+    }
+    pair.send_stream(Client, stream).finish().unwrap();
+    assert!(!pair.drive_bounded(1000));
+    assert_eq!(pair.streams(Client).send_streams(), 0);
+}
+
+#[test]
+fn bounded_send_buffers_apply_to_both_sides_of_local_and_remote_streams() {
+    let _guard = subscribe();
+    for bounded in [false, true] {
+        for opener in [Client, Server] {
+            let mut transport = TransportConfig::default();
+            transport.bounded_send_buffers(bounded);
+            let mut pair = ConnPair::builder().with_transport_cfg(transport).connect();
+            let stream = pair.streams(opener).open(Dir::Bi).unwrap();
+            let expected: Vec<_> = (0..2 * 64 * 1024 + 17)
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+            for sender in [opener, !opener] {
+                let mut source = vec![42; 512 * 1024];
+                source[4096..4096 + expected.len()].copy_from_slice(&expected);
+                let owner: Arc<[u8]> = source.into();
+                let weak = Arc::downgrade(&owner);
+                let mut chunks = [Bytes::from_owner(owner).slice(4096..4096 + expected.len())];
+                assert_eq!(
+                    pair.send_stream(sender, stream)
+                        .write_chunks(&mut chunks.as_mut_slice())
+                        .unwrap(),
+                    expected.len()
+                );
+                assert_eq!(weak.upgrade().is_none(), bounded);
+                pair.send_stream(sender, stream).finish().unwrap();
+                pair.drive();
+                if sender == opener {
+                    assert_eq!(pair.streams(!opener).accept(Dir::Bi), Some(stream));
+                }
+                let mut recv = pair.recv_stream(!sender, stream);
+                let mut received = recv.read(true).unwrap();
+                let mut actual = Vec::new();
+                while let Some(chunk) = received.next(usize::MAX).unwrap() {
+                    actual.extend_from_slice(&chunk.bytes);
+                }
+                let _ = received.finalize();
+                assert_eq!(actual, expected);
+                assert!(weak.upgrade().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn packet_history_limit_stops_before_an_unfunded_packet_is_built() {
+    packet_history_exhaustion(true);
+}
+
+#[test]
+fn packet_history_limit_without_gso_stops_before_an_unfunded_packet_is_built() {
+    packet_history_exhaustion(false);
+}
+
+fn packet_history_exhaustion(gso: bool) {
+    let _guard = subscribe();
+    let mut congestion = crate::congestion::NewRenoConfig::default();
+    congestion.initial_window(512 * 1024);
+    let mut transport = TransportConfig::default();
+    transport
+        .packet_history_limit(NonZeroUsize::new(32))
+        .enable_segmentation_offload(gso)
+        .deterministic_packet_numbers(true)
+        .congestion_controller_factory(Arc::new(congestion));
+    let mut client = client_config();
+    client.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(client);
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, stream)
+        .write(&vec![42; 128 * 1024])
+        .unwrap();
+    pair.client_send(client_ch, stream).finish().unwrap();
+    // Hold back server processing so no acknowledgment can release packet history.
+    pair.drive_client();
+    assert_matches!(pair.client_conn_mut(client_ch).poll(), Some(Event::ConnectionLost {
+        reason: ConnectionError::TransportError(error),
+    }) if error.code == TransportErrorCode::INTERNAL_ERROR && error.reason == "packet history memory limit");
+    let before = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+    pair.drive_client();
+    assert_eq!(
+        pair.client_conn_mut(client_ch).stats().udp_tx.datagrams,
+        before
+    );
+}
+
+#[test]
+fn packet_history_limit_allows_repeated_acknowledged_transfers() {
+    packet_history_repeated_transfers(false);
+}
+
+#[test]
+fn packet_history_limit_allows_repeated_transfers_with_packet_loss() {
+    packet_history_repeated_transfers(true);
+}
+
+fn packet_history_repeated_transfers(drop_packets: bool) {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport.packet_history_limit(NonZeroUsize::new(32));
+    let mut client = client_config();
+    client.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(client);
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let mut received = Vec::new();
+    for transfer in 0..128 {
+        pair.client_send(client_ch, stream)
+            .write(b"acknowledged")
+            .unwrap();
+        if drop_packets && transfer % 16 == 0 {
+            pair.drive_client();
+            assert!(pair.server.inbound.pop_last().is_some());
+        }
+        pair.drive();
+        let mut recv = pair.server_recv(server_ch, stream);
+        let mut chunks = recv.read(true).unwrap();
+        loop {
+            match chunks.next(usize::MAX) {
+                Ok(Some(chunk)) => received.extend_from_slice(&chunk.bytes),
+                Err(ReadError::Blocked) => break,
+                result => panic!("stream must stay open between transfers: {result:?}"),
+            }
+        }
+        let _ = chunks.finalize();
+        assert!(!pair.client_conn_mut(client_ch).is_closed());
+    }
+    pair.client_send(client_ch, stream).finish().unwrap();
+    pair.drive();
+    assert_eq!(received, b"acknowledged".repeat(128));
+    assert_eq!(pair.client_streams(client_ch).send_streams(), 0);
+}
+
+#[test]
 fn finish_stream_simple() {
     let _guard = subscribe();
     let mut pair = Pair::default();

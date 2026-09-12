@@ -48,6 +48,11 @@ impl<'a> Streams<'a> {
             return None;
         }
 
+        let index = usize::from(dir == Dir::Uni);
+        if self.state.allocated_local_count[index] >= self.state.max_concurrent_local_count[index] {
+            return None;
+        }
+
         if self.state.next[dir as usize] >= self.state.max[dir as usize] {
             self.state.streams_blocked[dir as usize] = true;
             return None;
@@ -56,6 +61,7 @@ impl<'a> Streams<'a> {
         self.state.next[dir as usize] += 1;
         let id = StreamId::new(self.state.side, dir, self.state.next[dir as usize] - 1);
         self.state.insert_local(id);
+        self.state.allocated_local_count[index] += 1;
         self.state.send_streams += 1;
         Some(id)
     }
@@ -287,7 +293,11 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.bounded_send_buffers,
+                self.state.send_buffer_range_limit,
+            ))
             .ok_or(WriteError::ClosedStream)?;
 
         if limit == 0 {
@@ -305,7 +315,7 @@ impl<'a> SendStream<'a> {
         let was_pending = stream.is_pending();
         let written = stream.write(source, limit)?;
         self.state.data_sent += written.bytes as u64;
-        self.state.unacked_data += written.bytes as u64;
+        self.state.retained_send_bytes += written.bytes as u64;
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);
         if !was_pending {
             self.state.pending.push_pending(self.id, stream.priority);
@@ -333,7 +343,11 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.bounded_send_buffers,
+                self.state.send_buffer_range_limit,
+            ))
             .ok_or(FinishError::ClosedStream)?;
 
         let was_pending = stream.is_pending();
@@ -355,7 +369,11 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.bounded_send_buffers,
+                self.state.send_buffer_range_limit,
+            ))
             .ok_or(ClosedStream { _private: () })?;
 
         if matches!(stream.state, SendState::ResetSent) {
@@ -366,7 +384,7 @@ impl<'a> SendStream<'a> {
         // Restore the portion of the send window consumed by the data that we aren't about to
         // send. We leave flow control alone because the peer's responsible for issuing additional
         // credit based on the final offset communicated in the RESET_STREAM frame we send.
-        self.state.unacked_data -= stream.pending.unacked();
+        self.state.retained_send_bytes -= stream.pending.retained();
         stream.reset();
         self.pending.reset_stream.push((self.id, error_code));
 
@@ -384,7 +402,11 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.bounded_send_buffers,
+                self.state.send_buffer_range_limit,
+            ))
             .ok_or(ClosedStream { _private: () })?;
 
         stream.priority = priority;

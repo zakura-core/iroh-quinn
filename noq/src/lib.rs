@@ -81,7 +81,7 @@ pub use crate::connection::{
     AcceptBi, AcceptUni, Closed, Connecting, Connection, OnClosed, OpenBi, OpenUni, ReadDatagram,
     ReadManyDatagrams, SendDatagram, SendDatagramError, WeakConnectionHandle, ZeroRttAccepted,
 };
-pub use crate::endpoint::{Accept, Endpoint, EndpointStats};
+pub use crate::endpoint::{Accept, Endpoint, EndpointStats, MAX_QUEUED_CONNECTION_DATAGRAMS};
 pub use crate::event_stream::{Lagged, NatTraversalUpdates, ObservedExternalAddr, PathEvents};
 pub use crate::incoming::{Incoming, IncomingFuture, RetryError};
 pub use crate::path::{AddressDiscovery, OpenPath, Path, WeakPathHandle};
@@ -107,6 +107,10 @@ enum ConnectionEvent {
         reason: bytes::Bytes,
     },
     Proto(proto::ConnectionEvent),
+    Datagram {
+        event: proto::ConnectionEvent,
+        _capacity: tokio::sync::OwnedSemaphorePermit,
+    },
     Rebind(Pin<Box<dyn UdpSender>>),
     LocalAddressChanged(Option<Arc<dyn NetworkChangeHint + Sync + Send>>),
 }

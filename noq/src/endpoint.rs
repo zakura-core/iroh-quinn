@@ -238,6 +238,31 @@ impl Endpoint {
         addr: SocketAddr,
         server_name: &str,
     ) -> Result<Connecting, ConnectError> {
+        self.connect_with_optional_owner(config, addr, server_name, None)
+    }
+
+    /// Connect while retaining an application owner through destruction of the
+    /// connection's internal state, including a failed or cancelled handshake.
+    ///
+    /// Reserve before calling. Objects returned to the application, such as
+    /// received chunks, can outlive the internal state and need their own owner.
+    pub fn connect_with_owner(
+        &self,
+        config: ClientConfig,
+        addr: SocketAddr,
+        server_name: &str,
+        owner: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Connecting, ConnectError> {
+        self.connect_with_optional_owner(config, addr, server_name, Some(owner))
+    }
+
+    fn connect_with_optional_owner(
+        &self,
+        config: ClientConfig,
+        addr: SocketAddr,
+        server_name: &str,
+        owner: Option<Box<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Connecting, ConnectError> {
         let mut endpoint = self.inner.state.lock().unwrap();
         if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
             return Err(ConnectError::EndpointStopping);
@@ -260,7 +285,7 @@ impl Endpoint {
         Ok(endpoint
             .recv_state
             .connections
-            .insert(ch, conn, sender, self.runtime.clone()))
+            .insert(ch, conn, sender, self.runtime.clone(), owner))
     }
 
     /// Switch to a new UDP socket
@@ -513,6 +538,7 @@ impl EndpointInner {
         &self,
         incoming: proto::Incoming,
         server_config: Option<Arc<ServerConfig>>,
+        owner: Option<Box<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Connecting, ConnectionError> {
         let mut state = self.state.lock().unwrap();
         let mut response_buffer = Vec::new();
@@ -528,7 +554,7 @@ impl EndpointInner {
                 Ok(state
                     .recv_state
                     .connections
-                    .insert(handle, conn, sender, runtime))
+                    .insert(handle, conn, sender, runtime, owner))
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
@@ -741,7 +767,7 @@ fn proto_ecn(ecn: udp::EcnCodepoint) -> proto::EcnCodepoint {
 #[derive(Debug)]
 struct ConnectionSet {
     /// Senders for communicating with the endpoint's connections
-    senders: FxHashMap<ConnectionHandle, mpsc::UnboundedSender<ConnectionEvent>>,
+    senders: FxHashMap<ConnectionHandle, ConnectionEventSender>,
     /// Stored to give out clones to new ConnectionInners
     sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
     /// Set if the endpoint has been manually closed
@@ -766,6 +792,7 @@ impl ConnectionSet {
         conn: proto::Connection,
         sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
+        owner: Option<Box<dyn std::any::Any + Send + Sync>>,
     ) -> Connecting {
         let (send, recv) = mpsc::unbounded_channel();
         if let Some((error_code, ref reason)) = self.close {
@@ -775,13 +802,53 @@ impl ConnectionSet {
             })
             .unwrap();
         }
-        self.senders.insert(handle, send);
+        self.senders.insert(
+            handle,
+            ConnectionEventSender {
+                control: send,
+                datagrams: Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_CONNECTION_DATAGRAMS)),
+            },
+        );
         self.active_connections += 1;
-        Connecting::new(handle, conn, self.sender.clone(), recv, sender, runtime)
+        Connecting::new(
+            handle,
+            conn,
+            self.sender.clone(),
+            recv,
+            sender,
+            runtime,
+            owner,
+        )
     }
 
     fn is_empty(&self) -> bool {
         self.senders.is_empty()
+    }
+}
+
+/// Maximum UDP datagrams waiting for one connection driver to process them.
+/// Packets beyond this bound are dropped before acknowledgment. Local close and
+/// endpoint control events do not compete for these slots.
+pub const MAX_QUEUED_CONNECTION_DATAGRAMS: usize = 256;
+
+#[derive(Debug)]
+struct ConnectionEventSender {
+    control: mpsc::UnboundedSender<ConnectionEvent>,
+    datagrams: Arc<tokio::sync::Semaphore>,
+}
+
+impl ConnectionEventSender {
+    fn send(&self, event: ConnectionEvent) -> Result<(), mpsc::error::SendError<ConnectionEvent>> {
+        self.control.send(event)
+    }
+
+    fn try_send_datagram(&self, event: proto::ConnectionEvent) {
+        if let Ok(capacity) = self.datagrams.clone().try_acquire_owned() {
+            let _ = self.control.send(ConnectionEvent::Datagram {
+                event,
+                _capacity: capacity,
+            });
+        }
     }
 }
 
@@ -983,12 +1050,11 @@ impl RecvState {
                                     // Ignoring errors from dropped connections that haven't yet
                                     // been cleaned up
                                     received_connection_packet = true;
-                                    let _ = self
-                                        .connections
+                                    self.connections
                                         .senders
                                         .get_mut(&handle)
                                         .unwrap()
-                                        .send(ConnectionEvent::Proto(event));
+                                        .try_send_datagram(event);
                                 }
                                 Some(DatagramEvent::Response(transmit)) => {
                                     respond(transmit, &response_buffer, sender);

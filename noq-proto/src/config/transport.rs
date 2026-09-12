@@ -3,7 +3,7 @@ use std::path::Path;
 use std::{
     fmt,
     net::SocketAddr,
-    num::{NonZeroU8, NonZeroU32},
+    num::{NonZeroU8, NonZeroU32, NonZeroUsize},
     sync::Arc,
 };
 
@@ -30,10 +30,16 @@ use crate::{QlogFactory, QlogFileFactory};
 pub struct TransportConfig {
     pub(crate) max_concurrent_bidi_streams: VarInt,
     pub(crate) max_concurrent_uni_streams: VarInt,
+    pub(crate) max_concurrent_local_bidi_streams: VarInt,
+    pub(crate) max_concurrent_local_uni_streams: VarInt,
     pub(crate) max_idle_timeout: Option<VarInt>,
     pub(crate) stream_receive_window: VarInt,
+    pub(crate) receive_fragment_limit: Option<NonZeroUsize>,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
+    pub(crate) bounded_send_buffers: bool,
+    pub(crate) send_buffer_range_limit: Option<NonZeroUsize>,
+    pub(crate) packet_history_limit: Option<NonZeroUsize>,
     pub(crate) send_fairness: bool,
 
     pub(crate) packet_threshold: u32,
@@ -91,6 +97,21 @@ impl TransportConfig {
         self
     }
 
+    /// Limit locally initiated bidirectional streams until both halves release
+    /// their protocol state. A stopped receive half still counts until FIN or
+    /// RESET establishes its final offset. The peer's stream limit also applies.
+    pub fn max_concurrent_local_bidi_streams(&mut self, value: VarInt) -> &mut Self {
+        self.max_concurrent_local_bidi_streams = value;
+        self
+    }
+
+    /// Limit locally initiated unidirectional streams until send state is freed.
+    /// The peer's advertised stream limit also applies.
+    pub fn max_concurrent_local_uni_streams(&mut self, value: VarInt) -> &mut Self {
+        self.max_concurrent_local_uni_streams = value;
+        self
+    }
+
     /// Maximum duration of inactivity to accept before timing out the connection.
     ///
     /// The true idle timeout is the minimum of this and the peer's own max idle timeout. `None`
@@ -131,6 +152,16 @@ impl TransportConfig {
         self
     }
 
+    /// Limit retained receive fragments per stream independently of payload
+    /// credit. Excess fragmentation closes the connection as a local resource
+    /// failure. `None` preserves the default behavior without this extra limit.
+    /// A finite limit also copies retained stream fragments into independent
+    /// allocations, including after compaction, so packet backing is released.
+    pub fn receive_fragment_limit(&mut self, value: Option<NonZeroUsize>) -> &mut Self {
+        self.receive_fragment_limit = value;
+        self
+    }
+
     /// Maximum number of bytes the peer may transmit across all streams of a connection before
     /// becoming blocked.
     ///
@@ -142,14 +173,51 @@ impl TransportConfig {
         self
     }
 
-    /// Maximum number of bytes to transmit to a peer without acknowledgment
+    /// Maximum stream payload bytes retained for transmission.
     ///
-    /// Provides an upper bound on memory when communicating with peers that issue large amounts of
-    /// flow control credit. Endpoints that wish to handle large numbers of connections robustly
-    /// should take care to set this low enough to guarantee memory exhaustion does not occur if
-    /// every connection uses the entire window.
+    /// Acknowledged bytes behind a missing prefix still consume this window until
+    /// the buffer releases them. Reset releases the abandoned payload immediately.
+    ///
+    /// This limits payload independently of flow control credit granted by the peer. It does not
+    /// bound backing allocations retained by zero-copy writes. Use `bounded_send_buffers` to
+    /// bound those allocations, with separate allowances for metadata and allocator overhead.
     pub fn send_window(&mut self, value: u64) -> &mut Self {
         self.send_window = value;
+        self
+    }
+
+    /// Copy outgoing stream data into independently owned blocks of at most 64 KiB.
+    ///
+    /// This prevents small slices from retaining large source allocations. Requested payload
+    /// storage is bounded by retained bytes plus two blocks per buffered stream, accounting for
+    /// a partially acknowledged front and spare tail capacity. Metadata and allocator overhead
+    /// need separate allowances. Fully acknowledged or reset buffers release all payload storage.
+    ///
+    /// Disabled by default to preserve zero-copy writes from `Bytes`.
+    pub fn bounded_send_buffers(&mut self, value: bool) -> &mut Self {
+        self.bounded_send_buffers = value;
+        self
+    }
+
+    /// Limit the acknowledgment and retransmission range sets retained by each send stream.
+    ///
+    /// Each set admits at most this many disjoint ranges. Duplicates, merges and acknowledged
+    /// prefixes remain allowed at capacity. Exceeding the limit closes the connection as a local
+    /// resource failure. Backing arrays can reserve up to twice this many records per set and
+    /// release their storage when empty. `None` preserves admission without this extra limit.
+    pub fn send_buffer_range_limit(&mut self, value: Option<NonZeroUsize>) -> &mut Self {
+        self.send_buffer_range_limit = value;
+        self
+    }
+
+    /// Maximum packet-number span retained in each path and encryption space.
+    ///
+    /// Packet history uses storage proportional to its index span, including
+    /// gaps. The connection terminates locally before allocating a history that
+    /// exceeds this bound. This also includes packets retained for loss recovery.
+    /// `None` preserves the behavior without this extra limit.
+    pub fn packet_history_limit(&mut self, value: Option<NonZeroUsize>) -> &mut Self {
+        self.packet_history_limit = value;
         self
     }
 
@@ -391,9 +459,9 @@ impl TransportConfig {
     /// Setting this to any nonzero value will enable the Multipath Extension for QUIC,
     /// <https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/>.
     ///
-    /// The value provided specifies the number maximum number of paths this endpoint may open
-    /// concurrently when multipath is negotiated. For any path to be opened, the remote must
-    /// enable multipath as well.
+    /// The value bounds retained path state and unused path authorization together.
+    /// Closing paths remain charged until their protocol state is discarded after draining.
+    /// For any path to be opened, the remote must enable multipath as well.
     pub fn max_concurrent_multipath_paths(&mut self, max_concurrent: u32) -> &mut Self {
         self.max_concurrent_multipath_paths = NonZeroU32::new(max_concurrent);
         self
@@ -556,12 +624,18 @@ impl Default for TransportConfig {
         Self {
             max_concurrent_bidi_streams: 100u32.into(),
             max_concurrent_uni_streams: 100u32.into(),
+            max_concurrent_local_bidi_streams: VarInt::MAX,
+            max_concurrent_local_uni_streams: VarInt::MAX,
             // 30 second default recommended by RFC 9308 § 3.2
             max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
+            receive_fragment_limit: None,
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
+            bounded_send_buffers: false,
+            send_buffer_range_limit: None,
             send_fairness: true,
+            packet_history_limit: None,
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
@@ -609,10 +683,16 @@ impl fmt::Debug for TransportConfig {
         let Self {
             max_concurrent_bidi_streams,
             max_concurrent_uni_streams,
+            max_concurrent_local_bidi_streams,
+            max_concurrent_local_uni_streams,
             max_idle_timeout,
             stream_receive_window,
+            receive_fragment_limit,
             receive_window,
             send_window,
+            bounded_send_buffers,
+            send_buffer_range_limit,
+            packet_history_limit,
             send_fairness,
             packet_threshold,
             time_threshold,
@@ -646,10 +726,22 @@ impl fmt::Debug for TransportConfig {
 
         s.field("max_concurrent_bidi_streams", max_concurrent_bidi_streams)
             .field("max_concurrent_uni_streams", max_concurrent_uni_streams)
+            .field(
+                "max_concurrent_local_bidi_streams",
+                max_concurrent_local_bidi_streams,
+            )
+            .field(
+                "max_concurrent_local_uni_streams",
+                max_concurrent_local_uni_streams,
+            )
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
+            .field("receive_fragment_limit", receive_fragment_limit)
             .field("receive_window", receive_window)
             .field("send_window", send_window)
+            .field("bounded_send_buffers", bounded_send_buffers)
+            .field("send_buffer_range_limit", send_buffer_range_limit)
+            .field("packet_history_limit", packet_history_limit)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)

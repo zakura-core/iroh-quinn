@@ -49,6 +49,7 @@ impl Recv {
         payload_len: usize,
         received: u64,
         max_data: u64,
+        fragment_limit: usize,
     ) -> Result<(u64, bool), TransportError> {
         let end = frame.offset + frame.data.len() as u64;
         if end >= 2u64.pow(62) {
@@ -79,7 +80,12 @@ impl Recv {
         // Don't bother storing data or releasing stream-level flow control credit if the stream's
         // already stopped
         if !self.stopped {
-            self.assembler.insert(frame.offset, frame.data, payload_len);
+            self.assembler.insert_with_limit(
+                frame.offset,
+                frame.data,
+                payload_len,
+                fragment_limit,
+            )?;
         }
 
         Ok((new_bytes, frame.fin && self.stopped))
@@ -470,6 +476,7 @@ mod tests {
                 123,
                 data_recvd,
                 data_recvd + 1024,
+                usize::MAX,
             )
             .unwrap();
         data_recvd += new_bytes;
@@ -503,6 +510,7 @@ mod tests {
                 123,
                 data_recvd,
                 data_recvd + 1024,
+                usize::MAX,
             )
             .unwrap();
         data_recvd += new_bytes;
@@ -528,6 +536,7 @@ mod tests {
                 123,
                 data_recvd,
                 data_recvd + 1024,
+                usize::MAX,
             )
             .unwrap();
         assert_eq!(

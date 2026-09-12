@@ -262,7 +262,7 @@ pub struct Connection {
 
     //
     // Multipath
-    /// Maximum number of concurrent paths
+    /// Maximum number of paths with retained state or unused authorization
     ///
     /// Initially set from the [`TransportConfig::max_concurrent_multipath_paths`]. Even
     /// when multipath is disabled this will be set to 1, it is not used in that case
@@ -301,6 +301,8 @@ pub struct Connection {
     /// [`Connection::local_cid_state`] since some of this has to be kept around for some
     /// time after a path is abandoned.
     abandoned_paths: AbandonedPaths,
+    /// Paths whose protocol state has been discarded and whose capacity can be reused.
+    discarded_path_count: u64,
 
     /// State for n0's (<https://n0.computer>) nat traversal protocol.
     n0_nat_traversal: n0_nat_traversal::State,
@@ -411,6 +413,13 @@ impl Connection {
                 config.send_window,
                 config.receive_window,
                 config.stream_receive_window,
+            )
+            .with_bounded_send_buffers(config.bounded_send_buffers)
+            .with_send_buffer_range_limit(config.send_buffer_range_limit)
+            .with_receive_fragment_limit(config.receive_fragment_limit)
+            .with_local_stream_limits(
+                config.max_concurrent_local_bidi_streams,
+                config.max_concurrent_local_uni_streams,
             ),
             datagrams: DatagramState::default(),
             config,
@@ -426,6 +435,7 @@ impl Connection {
             remote_max_path_id: PathId::ZERO,
             max_path_id_with_cids: PathId::ZERO,
             abandoned_paths: Default::default(),
+            discarded_path_count: 0,
 
             n0_nat_traversal: Default::default(),
             qlog,
@@ -1084,6 +1094,10 @@ impl Connection {
                 return Some(transmit);
             }
 
+            if self.state.is_drained() {
+                return None;
+            }
+
             let info = self.scheduling_info(path_id);
             if let Some(transmit) = self.poll_transmit_on_path(
                 now,
@@ -1098,6 +1112,10 @@ impl Connection {
                     self.partial_stats.transmits_tx += 1;
                 }
                 return Some(transmit);
+            }
+
+            if self.state.is_drained() {
+                return None;
             }
 
             // Continue checking other paths, tail-loss probes may need to be sent
@@ -1369,6 +1387,12 @@ impl Connection {
                 connection_close_pending,
                 pad_datagram,
             ) {
+                PollPathSpaceStatus::Drained => {
+                    // A terminal limit can be reached after earlier packets in this batch.
+                    // Discard the whole batch, which may end with an unpadded datagram.
+                    buf.clear();
+                    return None;
+                }
                 PollPathSpaceStatus::NothingToSend { path_blocked } => {
                     // Continue checking other spaces, tail-loss probes may need to be sent
                     // in all spaces.
@@ -1620,15 +1644,7 @@ impl Connection {
             let Some(mut builder) =
                 PacketBuilder::new(now, space_id, path_id, remote_cid, transmit, self)
             else {
-                // Confidentiality limit is exceeded and the connection has been killed. We
-                // should not send any other packets. This works in a roundabout way: We
-                // have started a datagram but not written anything into it. So even if we
-                // get called again for another space we will see an already started
-                // datagram and try and start another packet here. Then be stopped by the
-                // same confidentiality limit.
-                return PollPathSpaceStatus::NothingToSend {
-                    path_blocked: PathBlocked::No,
-                };
+                return PollPathSpaceStatus::Drained;
             };
             last_packet_number = Some(builder.packet_number);
 
@@ -2827,10 +2843,11 @@ impl Connection {
         self.streams.queue_max_stream_id(pending);
     }
 
-    /// Modify the number of open paths allowed when multipath is enabled
+    /// Modify the number of retained or authorized paths allowed when multipath is enabled
     ///
     /// When reducing the number of concurrent paths this will only affect delaying sending
-    /// new MAX_PATH_ID frames until fewer than this number of paths are possible.  To
+    /// new MAX_PATH_ID frames until fewer than this number of paths are possible. Closing
+    /// paths retain their capacity until their protocol state is discarded. To
     /// actively reduce paths they must be closed using [`Connection::close_path`], which
     /// can also be used to close not-yet-opened paths.
     ///
@@ -2845,18 +2862,23 @@ impl Connection {
             return Err(MultipathNotNegotiated { _private: () });
         }
         self.max_concurrent_paths = count;
-
-        let in_use_count = self
-            .local_max_path_id
-            .next()
-            .saturating_sub(self.abandoned_paths.len())
-            .as_u32();
-        let extra_needed = count.get().saturating_sub(in_use_count);
-        let new_max_path_id = self.local_max_path_id.saturating_add(extra_needed);
-
-        self.set_max_path_id(now, new_max_path_id);
+        self.issue_available_path_ids(now);
 
         Ok(())
+    }
+
+    /// Refresh path authorization while counting all retained protocol state.
+    fn issue_available_path_ids(&mut self, now: Instant) {
+        // Every u32 path ID, including zero, contributes one authorized slot.
+        let authorized = u64::from(self.local_max_path_id.as_u32()) + 1;
+        let retained_or_available = authorized
+            .checked_sub(self.discarded_path_count)
+            .expect("discarded paths were previously authorized");
+        let extra =
+            u64::from(self.max_concurrent_paths.get()).saturating_sub(retained_or_available);
+        let extra =
+            u32::try_from(extra).expect("additional paths cannot exceed the configured u32 count");
+        self.set_max_path_id(now, self.local_max_path_id.saturating_add(extra));
     }
 
     /// If needed, issues a new MAX_PATH_ID frame and new CIDs for any newly allowed paths
@@ -3022,7 +3044,7 @@ impl Connection {
                 // ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(path, packet);
 
-                self.on_packet_acked(now, path, packet, info);
+                self.on_packet_acked(now, path, packet, info)?;
             }
         }
 
@@ -3060,7 +3082,7 @@ impl Connection {
         }
 
         // Must be called before crypto/pto_count are clobbered
-        self.detect_lost_packets(now, space, path, true);
+        self.detect_lost_packets(now, space, path, true)?;
 
         // If the peer did not complete the handshake address validation the ACK could be
         // spoofed, e.g. in the Initial space. Setting the pto_count back to 0 removes the
@@ -3182,7 +3204,13 @@ impl Connection {
 
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
-    fn on_packet_acked(&mut self, now: Instant, path_id: PathId, pn: u64, info: SentPacket) {
+    fn on_packet_acked(
+        &mut self,
+        now: Instant,
+        path_id: PathId,
+        pn: u64,
+        info: SentPacket,
+    ) -> Result<(), TransportError> {
         let path = self.path_data_mut(path_id);
         let app_limited = path.app_limited;
         path.remove_in_flight(&info);
@@ -3203,8 +3231,9 @@ impl Connection {
         }
 
         for frame in info.stream_frames {
-            self.streams.received_ack_of(frame);
+            self.streams.received_ack_of(frame)?;
         }
+        Ok(())
     }
 
     fn set_key_discard_timer(&mut self, now: Instant, space: SpaceKind) {
@@ -3244,7 +3273,10 @@ impl Connection {
     fn on_loss_detection_timeout(&mut self, now: Instant, path_id: PathId) {
         if let Some((_, pn_space)) = self.loss_time_and_space(path_id) {
             // Time threshold loss Detection
-            self.detect_lost_packets(now, pn_space, path_id, false);
+            if let Err(error) = self.detect_lost_packets(now, pn_space, path_id, false) {
+                self.kill(error.into());
+                return;
+            }
             self.set_loss_detection_timer(now, path_id);
             return;
         }
@@ -3300,7 +3332,7 @@ impl Connection {
         pn_space: SpaceId,
         path_id: PathId,
         due_to_ack: bool,
-    ) {
+    ) -> Result<(), TransportError> {
         let mut lost_packets = Vec::<u64>::new();
         let mut lost_mtu_probe = None;
         let mut in_persistent_congestion = false;
@@ -3392,7 +3424,7 @@ impl Connection {
             loss_delay,
             in_persistent_congestion,
             size_of_lost_packets,
-        );
+        )
     }
 
     /// Drops the path state, declaring any remaining in-flight packets as lost
@@ -3420,7 +3452,7 @@ impl Connection {
                 lost_bytes = size_of_lost_packets,
                 "packets lost on path abandon"
             );
-            self.handle_lost_packets(
+            if let Err(error) = self.handle_lost_packets(
                 SpaceId::Data,
                 path_id,
                 now,
@@ -3429,7 +3461,10 @@ impl Connection {
                 Duration::ZERO,
                 false,
                 size_of_lost_packets,
-            );
+            ) {
+                self.kill(error.into());
+                return;
+            }
         }
         // Before removing the path, we fetch the final path stats via `Self::path_stats`.
         // This ensures snapshot values (like rtt) are properly updated.
@@ -3438,6 +3473,8 @@ impl Connection {
         self.partial_stats += path_stats;
         self.paths.remove(&path_id);
         self.spaces[SpaceId::Data].number_spaces.remove(&path_id);
+        self.discarded_path_count += 1; // Each unique u32 path ID is discarded at most once.
+        self.issue_available_path_ids(now);
 
         self.events.push_back(
             PathEvent::Discarded {
@@ -3458,7 +3495,7 @@ impl Connection {
         loss_delay: Duration,
         in_persistent_congestion: bool,
         size_of_lost_packets: u64,
-    ) {
+    ) -> Result<(), TransportError> {
         debug_assert!(lost_packets.is_sorted(), "lost_packets must be sorted");
 
         self.drain_lost_packets(now, pn_space, path_id);
@@ -3494,7 +3531,7 @@ impl Connection {
                     .remove_in_flight(&info);
 
                 for frame in info.stream_frames {
-                    self.streams.retransmit(frame);
+                    self.streams.retransmit(frame)?;
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 let path = self.path_data_mut(path_id);
@@ -3554,6 +3591,7 @@ impl Connection {
             self.path_data_mut(path_id).mtud.on_probe_lost();
             self.path_stats.get_mut(path_id).lost_plpmtud_probes += 1;
         }
+        Ok(())
     }
 
     /// Returns the earliest time packets should be declared lost for all spaces on a path.
@@ -4608,7 +4646,7 @@ impl Connection {
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.for_path(PathId::ZERO).take(0) {
-                    self.on_packet_acked(now, PathId::ZERO, 0, info);
+                    self.on_packet_acked(now, PathId::ZERO, 0, info)?;
                 };
 
                 self.discard_space(now, SpaceKind::Initial); // Make sure we clean up after
@@ -5368,8 +5406,6 @@ impl Connection {
                             now + 3 * pto,
                             self.qlog.with_time(now),
                         );
-
-                        self.set_max_path_id(now, self.local_max_path_id.saturating_add(1u8));
                     }
                 }
                 Frame::PathStatusAvailable(info) => {
@@ -6698,6 +6734,10 @@ impl Connection {
             // multipath is enabled, register the local and remote maximums
             self.local_max_path_id = local_max_path_id;
             self.remote_max_path_id = remote_max_path_id;
+            self.max_concurrent_paths = self
+                .config
+                .max_concurrent_multipath_paths
+                .expect("multipath was negotiated from the configured path count");
             let initial_max_path_id = local_max_path_id.min(remote_max_path_id);
             debug!(%initial_max_path_id, "multipath negotiated");
             multipath_enabled = true;
@@ -7224,7 +7264,7 @@ struct AbandonedPaths(ArrayRangeSet<ABANDONED_PATH_INLINE_RANGES, u32>);
 const ABANDONED_PATH_INLINE_RANGES: usize = 16;
 
 impl AbandonedPaths {
-    /// The number of abandoned paths.
+    #[cfg(test)]
     fn len(&self) -> u32 {
         self.0.elts_count()
     }
@@ -7261,6 +7301,8 @@ pub trait NetworkChangeHint: fmt::Debug + 'static {
 /// Return value for [`Connection::poll_transmit_path_space`].
 #[derive(Debug)]
 enum PollPathSpaceStatus {
+    /// The connection terminated during packet construction. Discard the entire batch.
+    Drained,
     /// Nothing was written into the [`TransmitBuf`].
     NothingToSend {
         /// [`PathBlocked`] helps differentiate whether the path had something but was blocked by

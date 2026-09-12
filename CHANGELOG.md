@@ -2,6 +2,14 @@
 
 All notable changes to noq will be documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Retain send and path capacity until the corresponding storage is released.
+- Add optional bounds for stream buffers, fragment and packet metadata, and local stream state.
+- Bound queued driver datagrams and allow connection owners to survive handshake and transport cleanup.
+
 ## [1.2.0](https://github.com/n0-computer/noq/compare/noq-v1.1.0..1.2.0) - 2026-08-24
 
 ### ⛰️  Features
@@ -2423,5 +2431,4 @@ All notable changes to noq will be documented in this file.
 ### Transport_parameters
 
 - :Error: Fail - ([a69dd0b](https://github.com/n0-computer/noq/commit/a69dd0bd0193f2b8ea2580422e509fb34c72daa7))
-
 
