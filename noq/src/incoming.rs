@@ -26,7 +26,7 @@ impl Incoming {
     /// Attempt to accept this incoming connection (an error may still occur)
     pub fn accept(mut self) -> Result<Connecting, ConnectionError> {
         let state = self.0.take().unwrap();
-        state.endpoint.accept(state.inner, None)
+        state.endpoint.accept(state.inner, None, None)
     }
 
     /// Accept this incoming connection using a custom configuration
@@ -37,7 +37,24 @@ impl Incoming {
         server_config: Arc<ServerConfig>,
     ) -> Result<Connecting, ConnectionError> {
         let state = self.0.take().unwrap();
-        state.endpoint.accept(state.inner, Some(server_config))
+        state
+            .endpoint
+            .accept(state.inner, Some(server_config), None)
+    }
+
+    /// Accept while retaining an application owner through destruction of the
+    /// connection's internal state. Reserve before calling, since accepting can
+    /// buffer early data before the handshake or application handler completes.
+    /// Returned application chunks require independent ownership.
+    pub fn accept_owned(
+        mut self,
+        server_config: Option<Arc<ServerConfig>>,
+        owner: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Connecting, ConnectionError> {
+        let state = self.0.take().unwrap();
+        state
+            .endpoint
+            .accept(state.inner, server_config, Some(owner))
     }
 
     /// Reject this incoming connection attempt

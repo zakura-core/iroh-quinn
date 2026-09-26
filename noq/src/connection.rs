@@ -52,6 +52,7 @@ impl Connecting {
         conn_events: mpsc::UnboundedReceiver<ConnectionEvent>,
         sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
+        release_owner: Option<Box<dyn std::any::Any + Send + Sync>>,
     ) -> Self {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
@@ -66,6 +67,7 @@ impl Connecting {
                 on_connected_send,
                 sender,
                 runtime.clone(),
+                release_owner,
             )),
             shared: Shared::default(),
         })));
@@ -1573,6 +1575,9 @@ pub(crate) struct State {
     pub(crate) observed_external_addr: watch::Sender<Option<SocketAddr>>,
     pub(crate) nat_traversal_updates: tokio::sync::broadcast::Sender<n0_nat_traversal::Event>,
     on_closed: Vec<oneshot::Sender<Closed>>,
+    // Keep this last: buffered protocol state and queued datagrams must be
+    // destroyed before the application's memory reservation is returned.
+    _release_owner: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl State {
@@ -1586,6 +1591,7 @@ impl State {
         on_connected: oneshot::Sender<bool>,
         sender: Pin<Box<dyn UdpSender>>,
         runtime: Arc<dyn Runtime>,
+        release_owner: Option<Box<dyn std::any::Any + Send + Sync>>,
     ) -> Self {
         Self {
             inner,
@@ -1614,6 +1620,7 @@ impl State {
             on_closed: Vec::new(),
             final_path_stats: Default::default(),
             path_refs: Default::default(),
+            _release_owner: release_owner,
         }
     }
 
