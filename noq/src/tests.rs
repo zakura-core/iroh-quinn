@@ -1917,3 +1917,5 @@ impl crate::runtime::Runtime for PanicPropagatingRuntime {
         TokioRuntime.now()
     }
 }
+
+mod connection_owner;
