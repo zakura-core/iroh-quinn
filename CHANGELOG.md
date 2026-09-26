@@ -2,6 +2,11 @@
 
 All notable changes to noq will be documented in this file.
 
+## Unreleased
+
+- Add optional incoming and outgoing connection owners retained until internal
+  transport state is destroyed, including after handshake failure or cancellation.
+
 ## [1.2.0](https://github.com/n0-computer/noq/compare/noq-v1.1.0..1.2.0) - 2026-08-24
 
 ### ⛰️  Features
