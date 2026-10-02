@@ -70,6 +70,26 @@ use wasm_bindgen_test::wasm_bindgen_test as test;
 // nodejs. #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 // wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
+/// RFC 9001 Appendix A.4: Retry integrity tag known-answer test
+#[test]
+fn retry_integrity_tag_rfc9001_a4() {
+    let orig_dst_cid = crate::ConnectionId::new(&hex!("8394c8f03e515708"));
+    let packet = hex!("ff000000010008f067a5502a4262b5746f6b656e");
+    let tag = hex!("04a265ba2eff4d829058fb3f0f2496ba");
+    let server = server_config().crypto;
+    assert_eq!(server.retry_tag(1, orig_dst_cid, &packet), tag);
+
+    let params = TransportParameters::default();
+    let client = client_config().crypto;
+    let session = client.start_session(1, "localhost", &params).unwrap();
+    let (header, token) = packet.split_at(15);
+    assert!(session.is_valid_retry(orig_dst_cid, header, &[token, &tag].concat()));
+    let mut bad_tag = tag;
+    bad_tag[15] ^= 1;
+    assert!(!session.is_valid_retry(orig_dst_cid, header, &[token, &bad_tag].concat()));
+    assert!(!session.is_valid_retry(orig_dst_cid, header, &tag[1..]));
+}
+
 #[test]
 fn version_negotiate_server() {
     let _guard = subscribe();
