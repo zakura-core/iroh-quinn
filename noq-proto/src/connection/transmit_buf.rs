@@ -209,6 +209,11 @@ impl<'a> TransmitBuf<'a> {
         self.buf.len()
     }
 
+    /// Discards the bytes written after `len`
+    pub(super) fn truncate(&mut self, len: usize) {
+        self.buf.truncate(len);
+    }
+
     /// Returns the already written bytes in the buffer
     pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
         self.buf.as_mut_slice()

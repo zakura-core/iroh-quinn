@@ -1677,11 +1677,11 @@ impl Connection {
                 //    write the CONNECTION_CLOSE even if we have many PATH_ACKs to send:
                 //    https://github.com/n0-computer/noq/issues/367.
                 debug_assert!(
-                    builder.frame_space_remaining() > frame::ConnectionClose::SIZE_BOUND,
+                    builder.frame_space_remaining() >= frame::ConnectionClose::SIZE_BOUND,
                     "ACKs should leave space for ConnectionClose"
                 );
                 let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
-                if frame::ConnectionClose::SIZE_BOUND < builder.frame_space_remaining() {
+                if frame::ConnectionClose::SIZE_BOUND <= builder.frame_space_remaining() {
                     let max_frame_size = builder.frame_space_remaining();
                     let close: Close = match self.state.as_type() {
                         StateType::Closed => {
@@ -6620,7 +6620,18 @@ impl Connection {
                 builder.write_frame(frame, stats);
             }
         } else {
-            builder.write_frame(frame::Ack::encoder(delay, ranges, ecn), stats);
+            let frame = frame::Ack::encoder(delay, ranges, ecn);
+            // A peer-provided Initial token can leave little space after the header. Skip
+            // an ACK that would not fit or would leave no space for CONNECTION_CLOSE.
+            if space_id == SpaceId::Initial {
+                let mut encoded = Vec::new();
+                crate::coding::Encodable::encode(&frame, &mut encoded);
+                let max_ack_size = builder.frame_space_remaining();
+                if encoded.len() + frame::ConnectionClose::SIZE_BOUND > max_ack_size {
+                    return;
+                }
+            }
+            builder.write_frame(frame, stats);
         }
     }
 
@@ -7811,6 +7822,46 @@ mod tests {
         });
         let err = result.expect_err("gapped flood must be rejected");
         assert_eq!(err.code, TransportErrorCode::INTERNAL_ERROR);
+    }
+
+    /// GHSA-wppq-2f6r-wfvm: Initial ACKs must fit next to a large token and CONNECTION_CLOSE
+    #[cfg(all(feature = "rustls", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[test]
+    fn large_initial_token_leaves_room_for_close() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let config = crate::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let cases = [(1084, true), (1085, false), (1119, false)];
+        for ((token_len, ack_fits), close) in
+            cases.into_iter().flat_map(|c| [(c, false), (c, true)])
+        {
+            let token = vec![0; token_len].into();
+            config.token_store.insert("localhost", token);
+            let mut endpoint = crate::Endpoint::new(Default::default(), None, true);
+            let now = Instant::now();
+            let addr = "[::1]:4433".parse().unwrap();
+            let (_, mut conn) = endpoint
+                .connect(now, config.clone(), addr, "localhost")
+                .unwrap();
+            let space = conn.spaces[SpaceId::Initial].for_path(PathId::ZERO);
+            for pn in (0..32).step_by(2) {
+                space.pending_acks.insert_one(pn, now);
+                space.dedup.insert(pn);
+                space
+                    .pending_acks
+                    .packet_received(now, pn, true, &space.dedup);
+            }
+            if close {
+                conn.close(now, 0u32.into(), Bytes::new());
+            }
+            let mut buf = Vec::new();
+            let sent = conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf);
+            assert!(sent.is_some() && buf.len() <= 1200, "token {token_len}");
+            let stats = conn.stats().frame_tx;
+            assert_eq!(stats.acks, ack_fits as u64, "token {token_len}");
+            assert_eq!(stats.connection_close, close as u64, "token {token_len}");
+        }
     }
 
     #[test]
