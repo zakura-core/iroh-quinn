@@ -1,7 +1,10 @@
 use std::{any::Any, io, str, sync::Arc};
 
-use aes_gcm::{KeyInit, aead::AeadMutInPlace};
+#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
+use aws_lc_rs::aead;
 use bytes::BytesMut;
+#[cfg(feature = "ring")]
+use ring::aead;
 pub use rustls::Error;
 use rustls::{
     self, CipherSuite,
@@ -165,33 +168,13 @@ impl crypto::Session for TlsSession {
     }
 
     fn is_valid_retry(&self, orig_dst_cid: ConnectionId, header: &[u8], payload: &[u8]) -> bool {
-        if payload.len() < 16 {
+        let Some((payload, tag)) = payload.split_last_chunk::<16>() else {
             return false;
-        }
-
-        let mut pseudo_packet =
-            Vec::with_capacity(header.len() + payload.len() + orig_dst_cid.len() + 1);
-        pseudo_packet.push(orig_dst_cid.len() as u8);
-        pseudo_packet.extend_from_slice(&orig_dst_cid);
-        pseudo_packet.extend_from_slice(header);
-        pseudo_packet.extend_from_slice(payload);
-
-        let (nonce, key) = match self.version {
-            Version::V1 => (&RETRY_INTEGRITY_NONCE_V1, &RETRY_INTEGRITY_KEY_V1),
-            Version::V1Draft => (&RETRY_INTEGRITY_NONCE_DRAFT, &RETRY_INTEGRITY_KEY_DRAFT),
-            _ => unreachable!(),
         };
-
-        let Some((aad, tag)) = pseudo_packet.split_last_chunk::<16>() else {
-            return false; // But length is actually already checked above.
-        };
-
-        // This implements https://www.rfc-editor.org/rfc/rfc9001#name-retry-packet-integrity
-        let key = aes_gcm::Key::<aes_gcm::Aes128Gcm>::from_slice(key);
-        let nonce = aes_gcm::Nonce::from_slice(nonce);
-        let tag = aes_gcm::Tag::from_slice(tag);
-        aes_gcm::Aes128Gcm::new(key)
-            .decrypt_in_place_detached(nonce, aad, &mut [], tag)
+        let (key, nonce) = retry_integrity_key(self.version);
+        let aad = retry_pseudo_packet(orig_dst_cid, header, payload);
+        let mut tag = *tag;
+        key.open_in_place(nonce, aead::Aad::from(aad), &mut tag)
             .is_ok()
     }
 
@@ -206,6 +189,33 @@ impl crypto::Session for TlsSession {
             .map_err(|_| ExportKeyingMaterialError)?;
         Ok(())
     }
+}
+
+#[cfg(not(any(feature = "ring", feature = "aws-lc-rs")))]
+compile_error!("the `rustls` feature needs `ring` or `aws-lc-rs` for the Retry integrity tag");
+
+/// Returns the AES-128-GCM key and nonce for the Retry integrity tag (RFC 9001 §5.8)
+fn retry_integrity_key(version: Version) -> (aead::LessSafeKey, aead::Nonce) {
+    let (nonce, key) = match version {
+        Version::V1 => (RETRY_INTEGRITY_NONCE_V1, &RETRY_INTEGRITY_KEY_V1),
+        Version::V1Draft => (RETRY_INTEGRITY_NONCE_DRAFT, &RETRY_INTEGRITY_KEY_DRAFT),
+        _ => unreachable!(),
+    };
+    let key = aead::UnboundKey::new(&aead::AES_128_GCM, key).expect("valid key length");
+    let nonce = aead::Nonce::assume_unique_for_key(nonce);
+    (aead::LessSafeKey::new(key), nonce)
+}
+
+/// Builds the Retry pseudo-packet: the original destination CID, then the Retry packet without
+/// its tag, given as `header` and `payload`
+fn retry_pseudo_packet(orig_dst_cid: ConnectionId, header: &[u8], payload: &[u8]) -> Vec<u8> {
+    let len = 1 + orig_dst_cid.len() + header.len() + payload.len();
+    let mut pseudo_packet = Vec::with_capacity(len);
+    pseudo_packet.push(orig_dst_cid.len() as u8);
+    pseudo_packet.extend_from_slice(&orig_dst_cid);
+    pseudo_packet.extend_from_slice(header);
+    pseudo_packet.extend_from_slice(payload);
+    pseudo_packet
 }
 
 const RETRY_INTEGRITY_KEY_DRAFT: [u8; 16] = [
@@ -564,23 +574,14 @@ impl crypto::ServerConfig for QuicServerConfig {
     fn retry_tag(&self, version: u32, orig_dst_cid: ConnectionId, packet: &[u8]) -> [u8; 16] {
         // Safe: `start_session()` is never called if `initial_keys()` rejected `version`
         let version = interpret_version(version).unwrap();
-        let (nonce, key) = match version {
-            Version::V1 => (&RETRY_INTEGRITY_NONCE_V1, &RETRY_INTEGRITY_KEY_V1),
-            Version::V1Draft => (&RETRY_INTEGRITY_NONCE_DRAFT, &RETRY_INTEGRITY_KEY_DRAFT),
-            _ => unreachable!(),
-        };
-
-        let mut pseudo_packet = Vec::with_capacity(packet.len() + orig_dst_cid.len() + 1);
-        pseudo_packet.push(orig_dst_cid.len() as u8);
-        pseudo_packet.extend_from_slice(&orig_dst_cid);
-        pseudo_packet.extend_from_slice(packet);
-
-        let nonce = aes_gcm::Nonce::from_slice(nonce);
-        let key = aes_gcm::Key::<aes_gcm::Aes128Gcm>::from_slice(key);
-        let tag = aes_gcm::Aes128Gcm::new(key)
-            .encrypt_in_place_detached(nonce, &pseudo_packet, &mut [])
-            .unwrap();
-        tag.into()
+        let (key, nonce) = retry_integrity_key(version);
+        let aad = retry_pseudo_packet(orig_dst_cid, packet, &[]);
+        let tag = key
+            .seal_in_place_separate_tag(nonce, aead::Aad::from(aad), &mut [])
+            .expect("AES-128-GCM seals an empty payload");
+        tag.as_ref()
+            .try_into()
+            .expect("AES-128-GCM tags are 16 bytes")
     }
 }
 
