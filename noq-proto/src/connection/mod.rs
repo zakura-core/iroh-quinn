@@ -4072,7 +4072,8 @@ impl Connection {
 
         crypto_space
             .crypto_stream
-            .insert(crypto.offset, crypto.data.clone(), payload_len);
+            .try_insert(crypto.offset, crypto.data.clone(), payload_len)
+            .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer"))?;
         while let Some(chunk) = crypto_space.crypto_stream.read(usize::MAX, true) {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
             if self.crypto_state.session.read_handshake(&chunk.bytes)? {
@@ -7750,6 +7751,34 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "rustls", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[test]
+    fn gapped_crypto_flood_closes_connection() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let config = crate::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let mut endpoint = crate::Endpoint::new(Default::default(), None, true);
+        let addr = "[::1]:4433".parse().unwrap();
+        let (_, mut conn) = endpoint
+            .connect(Instant::now(), config, addr, "localhost")
+            .unwrap();
+        // Withhold offset 0 so the handshake never consumes the buffered fragments.
+        let result = (0..8192u64).try_for_each(|i| {
+            let data = Bytes::from_static(&[0]);
+            conn.read_crypto(
+                SpaceId::Initial,
+                &frame::Crypto {
+                    offset: 1 + 2 * i,
+                    data,
+                },
+                1,
+            )
+        });
+        let err = result.expect_err("gapped flood must be rejected");
+        assert_eq!(err.code, TransportErrorCode::INTERNAL_ERROR);
+    }
 
     #[test]
     fn negotiate_max_idle_timeout_commutative() {
