@@ -58,7 +58,6 @@ aws-lc-rs = { workspace = true, optional = true }
 bytes = { workspace = true }
 criterion = { workspace = true, optional = true }
 derive_more = { workspace = true }
-enum-assoc = { workspace = true }
 fastbloom = { workspace = true, optional = true }
 identity-hash = { workspace = true }
 lru-slab = { workspace = true }
