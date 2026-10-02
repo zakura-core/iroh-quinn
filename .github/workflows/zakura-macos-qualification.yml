@@ -1,0 +1,48 @@
+# Zakura-only: qualifies the fork stack on GitHub-hosted macOS runners, because
+# the upstream test matrix needs n0's self-hosted macOS runners. This branch
+# exists to run this job; it is never merged.
+name: Zakura macOS qualification
+
+on:
+  push:
+    branches: [zakura/macos-qualification]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: macOS ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - run: uname -a && sw_vers && rustc -Vv
+      # GHSA-6pp4: Zakura builds noq without fast-apple-datapath, so recv_single
+      # is the live receive path on macOS. Fail if the regression tests vanish.
+      - name: 6pp4 regression tests (recv_single path)
+        run: |
+          cargo test --locked -p noq-udp recv_single -- --nocapture 2>&1 | tee 6pp4.log
+          grep -q "test result: ok. 2 passed" 6pp4.log
+      - name: noq-udp, default features
+        run: cargo test --locked -p noq-udp
+      - name: noq-udp, fast-apple-datapath (recv_single is its fallback)
+        run: cargo test --locked -p noq-udp --features fast-apple-datapath
+      - name: noq-proto, Zakura features
+        run: cargo test --locked -p noq-proto --no-default-features --features rustls,ring
+      - name: noq, Zakura features
+        run: cargo test --locked -p noq --no-default-features --features rustls,ring,runtime-tokio
+      - name: noq, default features
+        run: cargo test --locked -p noq
