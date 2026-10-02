@@ -28,111 +28,162 @@ use proptest::{collection, prelude::any, strategy::Strategy};
 #[cfg(test)]
 use test_strategy::Arbitrary;
 
-#[derive(
-    Copy, Clone, Eq, PartialEq, derive_more::Debug, derive_more::Display, enum_assoc::Assoc,
-)]
+#[derive(Copy, Clone, Eq, PartialEq, derive_more::Debug, derive_more::Display)]
 #[cfg_attr(test, derive(Arbitrary))]
 #[display(rename_all = "SCREAMING_SNAKE_CASE")]
 #[allow(missing_docs)]
-#[func(
-    pub(crate) const fn to_u64(self) -> u64,
-    const fn from_u64(rev: u64) -> Option<Self>,
-)]
 pub enum FrameType {
-    #[assoc(to_u64 = 0x00)]
     Padding,
-    #[assoc(to_u64 = 0x01)]
     Ping,
-    #[assoc(to_u64 = 0x02)]
     Ack,
-    #[assoc(to_u64 = 0x03)]
     AckEcn,
-    #[assoc(to_u64 = 0x04)]
     ResetStream,
-    #[assoc(to_u64 = 0x05)]
     StopSending,
-    #[assoc(to_u64 = 0x06)]
     Crypto,
-    #[assoc(to_u64 = 0x07)]
     NewToken,
     // STREAM
-    #[assoc(to_u64 = _0.to_u64())]
     Stream(StreamInfo),
-    #[assoc(to_u64 = 0x10)]
     MaxData,
-    #[assoc(to_u64 = 0x11)]
     MaxStreamData,
-    #[assoc(to_u64 = 0x12)]
     MaxStreamsBidi,
-    #[assoc(to_u64 = 0x13)]
     MaxStreamsUni,
-    #[assoc(to_u64 = 0x14)]
     DataBlocked,
-    #[assoc(to_u64 = 0x15)]
     StreamDataBlocked,
-    #[assoc(to_u64 = 0x16)]
     StreamsBlockedBidi,
-    #[assoc(to_u64 = 0x17)]
     StreamsBlockedUni,
-    #[assoc(to_u64 = 0x18)]
     NewConnectionId,
-    #[assoc(to_u64 = 0x19)]
     RetireConnectionId,
-    #[assoc(to_u64 = 0x1a)]
     PathChallenge,
-    #[assoc(to_u64 = 0x1b)]
     PathResponse,
-    #[assoc(to_u64 = 0x1c)]
     ConnectionClose,
-    #[assoc(to_u64 = 0x1d)]
     ApplicationClose,
-    #[assoc(to_u64 = 0x1e)]
     HandshakeDone,
     // ACK Frequency
-    #[assoc(to_u64 = 0xaf)]
     AckFrequency,
-    #[assoc(to_u64 = 0x1f)]
     ImmediateAck,
     // DATAGRAM
-    #[assoc(to_u64 = _0.to_u64())]
     Datagram(DatagramInfo),
     // ADDRESS DISCOVERY REPORT
-    #[assoc(to_u64 = 0x9f81a6)]
     ObservedIpv4Addr,
-    #[assoc(to_u64 = 0x9f81a7)]
     ObservedIpv6Addr,
     // Multipath
-    #[assoc(to_u64 = 0x3e)]
     PathAck,
-    #[assoc(to_u64 = 0x3f)]
     PathAckEcn,
-    #[assoc(to_u64 = 0x3e75)]
     PathAbandon,
-    #[assoc(to_u64 = 0x3e76)]
     PathStatusBackup,
-    #[assoc(to_u64 = 0x3e77)]
     PathStatusAvailable,
-    #[assoc(to_u64 = 0x3e78)]
     PathNewConnectionId,
-    #[assoc(to_u64 = 0x3e79)]
     PathRetireConnectionId,
-    #[assoc(to_u64 = 0x3e7a)]
     MaxPathId,
-    #[assoc(to_u64 = 0x3e7b)]
     PathsBlocked,
-    #[assoc(to_u64 = 0x3e7c)]
     PathCidsBlocked,
     // IROH'S NAT TRAVERSAL
-    #[assoc(to_u64 = 0x3d7f90)]
     AddIpv4Address,
-    #[assoc(to_u64 = 0x3d7f91)]
     AddIpv6Address,
-    #[assoc(to_u64 = 0x3d7f92)]
     ReachOutAtIpv4,
-    #[assoc(to_u64 = 0x3d7f93)]
     ReachOutAtIpv6,
-    #[assoc(to_u64 = 0x3d7f94)]
     RemoveAddress,
+}
+
+impl FrameType {
+    /// The wire codepoint of this frame type
+    pub(crate) const fn to_u64(self) -> u64 {
+        match self {
+            Self::Padding => 0x00,
+            Self::Ping => 0x01,
+            Self::Ack => 0x02,
+            Self::AckEcn => 0x03,
+            Self::ResetStream => 0x04,
+            Self::StopSending => 0x05,
+            Self::Crypto => 0x06,
+            Self::NewToken => 0x07,
+            Self::Stream(info) => info.to_u64(),
+            Self::MaxData => 0x10,
+            Self::MaxStreamData => 0x11,
+            Self::MaxStreamsBidi => 0x12,
+            Self::MaxStreamsUni => 0x13,
+            Self::DataBlocked => 0x14,
+            Self::StreamDataBlocked => 0x15,
+            Self::StreamsBlockedBidi => 0x16,
+            Self::StreamsBlockedUni => 0x17,
+            Self::NewConnectionId => 0x18,
+            Self::RetireConnectionId => 0x19,
+            Self::PathChallenge => 0x1a,
+            Self::PathResponse => 0x1b,
+            Self::ConnectionClose => 0x1c,
+            Self::ApplicationClose => 0x1d,
+            Self::HandshakeDone => 0x1e,
+            Self::AckFrequency => 0xaf,
+            Self::ImmediateAck => 0x1f,
+            Self::Datagram(info) => info.to_u64(),
+            Self::ObservedIpv4Addr => 0x9f81a6,
+            Self::ObservedIpv6Addr => 0x9f81a7,
+            Self::PathAck => 0x3e,
+            Self::PathAckEcn => 0x3f,
+            Self::PathAbandon => 0x3e75,
+            Self::PathStatusBackup => 0x3e76,
+            Self::PathStatusAvailable => 0x3e77,
+            Self::PathNewConnectionId => 0x3e78,
+            Self::PathRetireConnectionId => 0x3e79,
+            Self::MaxPathId => 0x3e7a,
+            Self::PathsBlocked => 0x3e7b,
+            Self::PathCidsBlocked => 0x3e7c,
+            Self::AddIpv4Address => 0x3d7f90,
+            Self::AddIpv6Address => 0x3d7f91,
+            Self::ReachOutAtIpv4 => 0x3d7f92,
+            Self::ReachOutAtIpv6 => 0x3d7f93,
+            Self::RemoveAddress => 0x3d7f94,
+        }
+    }
+
+    /// The frame type with wire codepoint `value`, except STREAM and DATAGRAM
+    const fn from_u64(value: u64) -> Option<Self> {
+        Some(match value {
+            0x00 => Self::Padding,
+            0x01 => Self::Ping,
+            0x02 => Self::Ack,
+            0x03 => Self::AckEcn,
+            0x04 => Self::ResetStream,
+            0x05 => Self::StopSending,
+            0x06 => Self::Crypto,
+            0x07 => Self::NewToken,
+            0x10 => Self::MaxData,
+            0x11 => Self::MaxStreamData,
+            0x12 => Self::MaxStreamsBidi,
+            0x13 => Self::MaxStreamsUni,
+            0x14 => Self::DataBlocked,
+            0x15 => Self::StreamDataBlocked,
+            0x16 => Self::StreamsBlockedBidi,
+            0x17 => Self::StreamsBlockedUni,
+            0x18 => Self::NewConnectionId,
+            0x19 => Self::RetireConnectionId,
+            0x1a => Self::PathChallenge,
+            0x1b => Self::PathResponse,
+            0x1c => Self::ConnectionClose,
+            0x1d => Self::ApplicationClose,
+            0x1e => Self::HandshakeDone,
+            0xaf => Self::AckFrequency,
+            0x1f => Self::ImmediateAck,
+            0x9f81a6 => Self::ObservedIpv4Addr,
+            0x9f81a7 => Self::ObservedIpv6Addr,
+            0x3e => Self::PathAck,
+            0x3f => Self::PathAckEcn,
+            0x3e75 => Self::PathAbandon,
+            0x3e76 => Self::PathStatusBackup,
+            0x3e77 => Self::PathStatusAvailable,
+            0x3e78 => Self::PathNewConnectionId,
+            0x3e79 => Self::PathRetireConnectionId,
+            0x3e7a => Self::MaxPathId,
+            0x3e7b => Self::PathsBlocked,
+            0x3e7c => Self::PathCidsBlocked,
+            0x3d7f90 => Self::AddIpv4Address,
+            0x3d7f91 => Self::AddIpv6Address,
+            0x3d7f92 => Self::ReachOutAtIpv4,
+            0x3d7f93 => Self::ReachOutAtIpv6,
+            0x3d7f94 => Self::RemoveAddress,
+            _ => return None,
+        })
+    }
 }
 
 /// Encounter a frame ID that was not valid.
@@ -181,10 +232,7 @@ impl Encodable for FrameType {
 ///
 /// This includes some "encoder" types instead of the actual read frame, when writing directly to
 /// a buffer is more efficient than building the Frame itself.
-#[derive(derive_more::From, enum_assoc::Assoc, derive_more::Display)]
-#[func(fn encode_inner<B: BufMut>(&self, buf: &mut B) {_0.encode(buf)})]
-#[func(pub(crate) const fn get_type(&self) -> FrameType {_0.get_type()})]
-#[cfg_attr(feature = "qlog", func(pub(crate) fn to_qlog(&self) -> qlog::events::quic::QuicFrame {_0.to_qlog()}))]
+#[derive(derive_more::From, derive_more::Display)]
 pub(super) enum EncodableFrame<'a> {
     PathAck(PathAckEncoder<'a>),
     Ack(AckEncoder<'a>),
@@ -219,7 +267,59 @@ pub(super) enum EncodableFrame<'a> {
     StreamsBlocked(StreamsBlocked),
 }
 
+/// Evaluates `$body` with `$frame` bound to the frame inside any [`EncodableFrame`] variant
+macro_rules! with_encodable_frame {
+    ($value:expr, $frame:ident => $body:expr) => {
+        match $value {
+            EncodableFrame::PathAck($frame) => $body,
+            EncodableFrame::Ack($frame) => $body,
+            EncodableFrame::Close($frame) => $body,
+            EncodableFrame::PathResponse($frame) => $body,
+            EncodableFrame::HandshakeDone($frame) => $body,
+            EncodableFrame::ReachOut($frame) => $body,
+            EncodableFrame::ObservedAddr($frame) => $body,
+            EncodableFrame::Ping($frame) => $body,
+            EncodableFrame::ImmediateAck($frame) => $body,
+            EncodableFrame::AckFrequency($frame) => $body,
+            EncodableFrame::PathChallenge($frame) => $body,
+            EncodableFrame::Crypto($frame) => $body,
+            EncodableFrame::PathAbandon($frame) => $body,
+            EncodableFrame::PathStatusAvailable($frame) => $body,
+            EncodableFrame::PathStatusBackup($frame) => $body,
+            EncodableFrame::MaxPathId($frame) => $body,
+            EncodableFrame::PathsBlocked($frame) => $body,
+            EncodableFrame::PathCidsBlocked($frame) => $body,
+            EncodableFrame::ResetStream($frame) => $body,
+            EncodableFrame::StopSending($frame) => $body,
+            EncodableFrame::NewConnectionId($frame) => $body,
+            EncodableFrame::RetireConnectionId($frame) => $body,
+            EncodableFrame::Datagram($frame) => $body,
+            EncodableFrame::NewToken($frame) => $body,
+            EncodableFrame::AddAddress($frame) => $body,
+            EncodableFrame::RemoveAddress($frame) => $body,
+            EncodableFrame::StreamMeta($frame) => $body,
+            EncodableFrame::MaxData($frame) => $body,
+            EncodableFrame::MaxStreamData($frame) => $body,
+            EncodableFrame::MaxStreams($frame) => $body,
+            EncodableFrame::StreamsBlocked($frame) => $body,
+        }
+    };
+}
+
 impl<'a> EncodableFrame<'a> {
+    fn encode_inner<B: BufMut>(&self, buf: &mut B) {
+        with_encodable_frame!(self, frame => frame.encode(buf))
+    }
+
+    pub(crate) const fn get_type(&self) -> FrameType {
+        with_encodable_frame!(self, frame => frame.get_type())
+    }
+
+    #[cfg(feature = "qlog")]
+    pub(crate) fn to_qlog(&self) -> qlog::events::quic::QuicFrame {
+        with_encodable_frame!(self, frame => frame.to_qlog())
+    }
+
     /// Whether this is an ACK-eliciting frame.
     pub(crate) fn is_ack_eliciting(&self) -> bool {
         match self {
@@ -2521,6 +2621,81 @@ mod test {
     use super::*;
     use crate::coding::Encodable;
     use assert_matches::assert_matches;
+
+    /// Every frame type with its wire codepoint; STREAM and DATAGRAM with their lowest one
+    const ALL_FRAME_TYPES: [(FrameType, u64); 44] = [
+        (FrameType::Padding, 0x0),
+        (FrameType::Ping, 0x1),
+        (FrameType::Ack, 0x2),
+        (FrameType::AckEcn, 0x3),
+        (FrameType::ResetStream, 0x4),
+        (FrameType::StopSending, 0x5),
+        (FrameType::Crypto, 0x6),
+        (FrameType::NewToken, 0x7),
+        (FrameType::Stream(StreamInfo(0x08)), 0x8),
+        (FrameType::MaxData, 0x10),
+        (FrameType::MaxStreamData, 0x11),
+        (FrameType::MaxStreamsBidi, 0x12),
+        (FrameType::MaxStreamsUni, 0x13),
+        (FrameType::DataBlocked, 0x14),
+        (FrameType::StreamDataBlocked, 0x15),
+        (FrameType::StreamsBlockedBidi, 0x16),
+        (FrameType::StreamsBlockedUni, 0x17),
+        (FrameType::NewConnectionId, 0x18),
+        (FrameType::RetireConnectionId, 0x19),
+        (FrameType::PathChallenge, 0x1a),
+        (FrameType::PathResponse, 0x1b),
+        (FrameType::ConnectionClose, 0x1c),
+        (FrameType::ApplicationClose, 0x1d),
+        (FrameType::HandshakeDone, 0x1e),
+        (FrameType::ImmediateAck, 0x1f),
+        (FrameType::Datagram(DatagramInfo(0x30)), 0x30),
+        (FrameType::PathAck, 0x3e),
+        (FrameType::PathAckEcn, 0x3f),
+        (FrameType::AckFrequency, 0xaf),
+        (FrameType::PathAbandon, 0x3e75),
+        (FrameType::PathStatusBackup, 0x3e76),
+        (FrameType::PathStatusAvailable, 0x3e77),
+        (FrameType::PathNewConnectionId, 0x3e78),
+        (FrameType::PathRetireConnectionId, 0x3e79),
+        (FrameType::MaxPathId, 0x3e7a),
+        (FrameType::PathsBlocked, 0x3e7b),
+        (FrameType::PathCidsBlocked, 0x3e7c),
+        (FrameType::AddIpv4Address, 0x3d7f90),
+        (FrameType::AddIpv6Address, 0x3d7f91),
+        (FrameType::ReachOutAtIpv4, 0x3d7f92),
+        (FrameType::ReachOutAtIpv6, 0x3d7f93),
+        (FrameType::RemoveAddress, 0x3d7f94),
+        (FrameType::ObservedIpv4Addr, 0x9f81a6),
+        (FrameType::ObservedIpv6Addr, 0x9f81a7),
+    ];
+
+    #[test]
+    fn frame_type_round_trip() {
+        let mut listed = std::collections::HashSet::new();
+        for (ty, value) in ALL_FRAME_TYPES {
+            assert_eq!(ty.to_u64(), value, "{ty:?}");
+            assert_eq!(FrameType::try_from(value), Ok(ty));
+            listed.insert(std::mem::discriminant(&ty));
+        }
+        assert_eq!(listed.len(), 44, "a frame type is listed twice");
+
+        // No other codepoint below 2^24 decodes, and every decoded one round-trips.
+        let mut found = std::collections::HashSet::new();
+        let mut codepoints = 0;
+        for value in 0..1 << 24 {
+            if let Ok(ty) = FrameType::try_from(value) {
+                assert_eq!(ty.to_u64(), value);
+                found.insert(std::mem::discriminant(&ty));
+                codepoints += 1;
+            }
+        }
+        assert_eq!(found, listed);
+        assert_eq!(
+            codepoints,
+            44 - 2 + StreamInfo::VALUES.count() + DatagramInfo::VALUES.count()
+        );
+    }
 
     #[test]
     fn frame_type() {
