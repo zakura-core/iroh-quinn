@@ -1677,11 +1677,11 @@ impl Connection {
                 //    write the CONNECTION_CLOSE even if we have many PATH_ACKs to send:
                 //    https://github.com/n0-computer/noq/issues/367.
                 debug_assert!(
-                    builder.frame_space_remaining() > frame::ConnectionClose::SIZE_BOUND,
+                    builder.frame_space_remaining() >= frame::ConnectionClose::SIZE_BOUND,
                     "ACKs should leave space for ConnectionClose"
                 );
                 let stats = &mut self.path_stats.get_mut(path_id).frame_tx;
-                if frame::ConnectionClose::SIZE_BOUND < builder.frame_space_remaining() {
+                if frame::ConnectionClose::SIZE_BOUND <= builder.frame_space_remaining() {
                     let max_frame_size = builder.frame_space_remaining();
                     let close: Close = match self.state.as_type() {
                         StateType::Closed => {
@@ -4072,7 +4072,8 @@ impl Connection {
 
         crypto_space
             .crypto_stream
-            .insert(crypto.offset, crypto.data.clone(), payload_len);
+            .try_insert(crypto.offset, crypto.data.clone(), payload_len)
+            .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer"))?;
         while let Some(chunk) = crypto_space.crypto_stream.read(usize::MAX, true) {
             trace!("consumed {} CRYPTO bytes", chunk.bytes.len());
             if self.crypto_state.session.read_handshake(&chunk.bytes)? {
@@ -5164,6 +5165,9 @@ impl Connection {
                         ));
                     }
 
+                    /// Ensure `pending_retired` cannot grow without bound. Limit is
+                    /// somewhat arbitrary but very permissive.
+                    const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
                     use crate::cid_queue::InsertError;
                     match remote_cids.insert(frame) {
                         Ok(None) => {
@@ -5172,9 +5176,6 @@ impl Connection {
                         Ok(Some((retired, reset_token))) => {
                             let pending_retired =
                                 &mut self.spaces[SpaceId::Data].pending.retire_cids;
-                            /// Ensure `pending_retired` cannot grow without bound. Limit is
-                            /// somewhat arbitrary but very permissive.
-                            const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
                             // We don't bother counting in-flight frames because those are bounded
                             // by congestion control.
                             if (pending_retired.len() as u64)
@@ -5197,10 +5198,14 @@ impl Connection {
                             // RETIRE_CONNECTION_ID might not have been previously sent if e.g. a
                             // range of connection IDs larger than the active connection ID limit
                             // was retired all at once via retire_prior_to.
-                            self.spaces[SpaceId::Data]
-                                .pending
-                                .retire_cids
-                                .push((path_id, frame.sequence));
+                            let pending_retired =
+                                &mut self.spaces[SpaceId::Data].pending.retire_cids;
+                            if pending_retired.len() as u64 >= MAX_PENDING_RETIRED_CIDS {
+                                return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(
+                                    "queued too many retired CIDs",
+                                ));
+                            }
+                            pending_retired.push((path_id, frame.sequence));
                             continue;
                         }
                     };
@@ -6615,7 +6620,18 @@ impl Connection {
                 builder.write_frame(frame, stats);
             }
         } else {
-            builder.write_frame(frame::Ack::encoder(delay, ranges, ecn), stats);
+            let frame = frame::Ack::encoder(delay, ranges, ecn);
+            // A peer-provided Initial token can leave little space after the header. Skip
+            // an ACK that would not fit or would leave no space for CONNECTION_CLOSE.
+            if space_id == SpaceId::Initial {
+                let mut encoded = Vec::new();
+                crate::coding::Encodable::encode(&frame, &mut encoded);
+                let max_ack_size = builder.frame_space_remaining();
+                if encoded.len() + frame::ConnectionClose::SIZE_BOUND > max_ack_size {
+                    return;
+                }
+            }
+            builder.write_frame(frame, stats);
         }
     }
 
@@ -6901,6 +6917,35 @@ impl Connection {
         debug_assert!(!self.state.is_drained()); // requirement for endpoint_events
         self.endpoint_events
             .push_back(EndpointEventInner::NeedIdentifiers(PathId::ZERO, now, n));
+    }
+
+    /// Processes `payload` as the frames of 1-RTT packet `number` on `PathId::ZERO`
+    #[cfg(test)]
+    pub(crate) fn process_frames(
+        &mut self,
+        now: Instant,
+        number: u64,
+        payload: &[u8],
+    ) -> Result<(), TransportError> {
+        let header = Header::Short {
+            spin: false,
+            key_phase: false,
+            dst_cid: ConnectionId::new(&[]),
+            number: PacketNumber::U8(0),
+        };
+        let payload = BytesMut::from(payload);
+        let packet = Packet {
+            header,
+            header_data: Bytes::new(),
+            payload,
+        };
+        let network_path = self.path_data(PathId::ZERO).network_path;
+        self.spaces[SpaceId::Data]
+            .for_path(PathId::ZERO)
+            .dedup
+            .insert(number);
+        let qlog = &mut QlogRecvPacket::new(0);
+        self.process_payload(now, network_path, PathId::ZERO, number, packet, qlog)
     }
 
     /// Check the current active remote CID sequence for `PathId::ZERO`
@@ -7750,6 +7795,74 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "rustls", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[test]
+    fn gapped_crypto_flood_closes_connection() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let config = crate::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let mut endpoint = crate::Endpoint::new(Default::default(), None, true);
+        let addr = "[::1]:4433".parse().unwrap();
+        let (_, mut conn) = endpoint
+            .connect(Instant::now(), config, addr, "localhost")
+            .unwrap();
+        // Withhold offset 0 so the handshake never consumes the buffered fragments.
+        let result = (0..8192u64).try_for_each(|i| {
+            let data = Bytes::from_static(&[0]);
+            conn.read_crypto(
+                SpaceId::Initial,
+                &frame::Crypto {
+                    offset: 1 + 2 * i,
+                    data,
+                },
+                1,
+            )
+        });
+        let err = result.expect_err("gapped flood must be rejected");
+        assert_eq!(err.code, TransportErrorCode::INTERNAL_ERROR);
+    }
+
+    /// GHSA-wppq-2f6r-wfvm: Initial ACKs must fit next to a large token and CONNECTION_CLOSE
+    #[cfg(all(feature = "rustls", any(feature = "aws-lc-rs", feature = "ring")))]
+    #[test]
+    fn large_initial_token_leaves_room_for_close() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let config = crate::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let cases = [(1084, true), (1085, false), (1119, false)];
+        for ((token_len, ack_fits), close) in
+            cases.into_iter().flat_map(|c| [(c, false), (c, true)])
+        {
+            let token = vec![0; token_len].into();
+            config.token_store.insert("localhost", token);
+            let mut endpoint = crate::Endpoint::new(Default::default(), None, true);
+            let now = Instant::now();
+            let addr = "[::1]:4433".parse().unwrap();
+            let (_, mut conn) = endpoint
+                .connect(now, config.clone(), addr, "localhost")
+                .unwrap();
+            let space = conn.spaces[SpaceId::Initial].for_path(PathId::ZERO);
+            for pn in (0..32).step_by(2) {
+                space.pending_acks.insert_one(pn, now);
+                space.dedup.insert(pn);
+                space
+                    .pending_acks
+                    .packet_received(now, pn, true, &space.dedup);
+            }
+            if close {
+                conn.close(now, 0u32.into(), Bytes::new());
+            }
+            let mut buf = Vec::new();
+            let sent = conn.poll_transmit(now, NonZeroUsize::MIN, &mut buf);
+            assert!(sent.is_some() && buf.len() <= 1200, "token {token_len}");
+            let stats = conn.stats().frame_tx;
+            assert_eq!(stats.acks, ack_fits as u64, "token {token_len}");
+            assert_eq!(stats.connection_close, close as u64, "token {token_len}");
+        }
+    }
 
     #[test]
     fn negotiate_max_idle_timeout_commutative() {

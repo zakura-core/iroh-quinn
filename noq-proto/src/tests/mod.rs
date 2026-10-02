@@ -2033,6 +2033,34 @@ fn cid_rotation() {
     }
 }
 
+/// GHSA-hmxj-32vh-65vr: NEW_CONNECTION_ID frames for retired CIDs must not queue
+/// RETIRE_CONNECTION_ID frames without bound.
+#[test]
+fn retired_cid_flood_is_bounded() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    let now = pair.time;
+    pair.server_conn_mut(server_ch).rotate_local_cid(1, now);
+    pair.drive();
+    assert_matches!(pair.client_conn_mut(client_ch).active_remote_cid_seq(), 1);
+
+    let mut payload = Vec::new();
+    frame::NewConnectionId {
+        path_id: None,
+        sequence: 0,
+        retire_prior_to: 0,
+        id: crate::ConnectionId::new(&[0xab; 8]),
+        reset_token: [0; 16].into(),
+    }
+    .encode(&mut payload);
+    let conn = pair.client_conn_mut(client_ch);
+    let err = (0..10_000u64)
+        .try_for_each(|i| conn.process_frames(now, 1_000_000 + i, &payload))
+        .expect_err("retired CID flood must be rejected");
+    assert_eq!(err.code, TransportErrorCode::CONNECTION_ID_LIMIT_ERROR);
+}
+
 #[test]
 fn cid_retirement() {
     let _guard = subscribe();

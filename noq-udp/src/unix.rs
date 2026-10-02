@@ -537,6 +537,7 @@ fn recv_via_recvmmsg(
 }
 
 #[cfg(any(
+    test,
     target_os = "openbsd",
     target_os = "netbsd",
     target_os = "dragonfly",
@@ -553,15 +554,17 @@ pub(crate) fn recv_single(
     let mut name = MaybeUninit::<libc::sockaddr_storage>::uninit();
     let mut ctrl = cmsg::Aligned(MaybeUninit::<[u8; cmsg::LEN]>::uninit());
     let mut hdr = unsafe { mem::zeroed::<libc::msghdr>() };
-    prepare_recv(&mut bufs[0], &mut name, &mut ctrl, &mut hdr);
     let n = loop {
+        // `recvmsg` updates `hdr`, so reset it before every attempt.
+        prepare_recv(&mut bufs[0], &mut name, &mut ctrl, &mut hdr);
         let n = unsafe { libc::recvmsg(io.as_raw_fd(), &mut hdr, 0) };
 
-        if hdr.msg_flags & libc::MSG_TRUNC != 0 {
-            continue;
-        }
-
         if n >= 0 {
+            // Skip a truncated datagram. Check only after a successful receive: a failed
+            // `recvmsg` leaves the flag set, and retrying on it would spin forever.
+            if hdr.msg_flags & libc::MSG_TRUNC != 0 {
+                continue;
+            }
             break n;
         }
 
@@ -912,5 +915,93 @@ pub(crate) fn retry_if_interrupted(mut f: impl FnMut() -> isize) -> io::Result<i
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e);
         }
+    }
+}
+
+/// GHSA-6pp4-4cxf-xf88: `recv_single` must not spin after a truncated datagram.
+#[cfg(test)]
+mod tests {
+    use std::{net::UdpSocket, sync::mpsc, thread, time::Duration};
+
+    use super::*;
+
+    /// Waits until `socket` has a datagram queued, without consuming it.
+    ///
+    /// macOS delivers loopback datagrams asynchronously, so a datagram can
+    /// still be in flight when `send_to` returns.
+    fn wait_for_datagram(socket: &UdpSocket) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match socket.peek(&mut [0; 1]) {
+                Ok(_) => return,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("no datagram arrived: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn recv_single_after_truncation_returns_would_block_instead_of_spin() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let address = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender.send_to(&[0; 16], address).unwrap();
+        // Without this wait, `recv_single` can return `WouldBlock` before the
+        // datagram arrives, and the test passes without truncating anything.
+        wait_for_datagram(&receiver);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut buffer = [0; 8];
+            let bufs = &mut [IoSliceMut::new(&mut buffer)];
+            let result = recv_single(SockRef::from(&receiver), bufs, &mut [RecvMeta::default()]);
+            done_tx.send(result).unwrap();
+            receiver
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            // Release a regressed receive loop before failing the test.
+            sender.send_to(b"ok", address).unwrap();
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap();
+        }
+        let receiver = worker.join().unwrap();
+        assert!(matches!(result, Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock));
+        // `recv_single` consumed the truncated datagram before it returned.
+        assert_eq!(
+            receiver.peek(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn recv_single_skips_truncated_datagrams() {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        // Blocking with a timeout, so `recv_single` waits for "ok" if it is
+        // still in flight after the truncated datagram (macOS loopback).
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = receiver.local_addr().unwrap();
+        sender.send_to(&[0; 16], address).unwrap();
+        sender.send_to(b"ok", address).unwrap();
+
+        let mut buffer = [0; 8];
+        let mut meta = [RecvMeta::default()];
+        let bufs = &mut [IoSliceMut::new(&mut buffer)];
+        assert_eq!(
+            recv_single(SockRef::from(&receiver), bufs, &mut meta).unwrap(),
+            1
+        );
+        assert_eq!(&buffer[..meta[0].len], b"ok");
+        assert_eq!(meta[0].addr, sender.local_addr().unwrap());
     }
 }

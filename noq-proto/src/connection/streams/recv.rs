@@ -79,7 +79,9 @@ impl Recv {
         // Don't bother storing data or releasing stream-level flow control credit if the stream's
         // already stopped
         if !self.stopped {
-            self.assembler.insert(frame.offset, frame.data, payload_len);
+            self.assembler
+                .try_insert(frame.offset, frame.data, payload_len)
+                .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in stream buffer"))?;
         }
 
         Ok((new_bytes, frame.fin && self.stopped))
@@ -450,6 +452,24 @@ mod tests {
     use crate::{Dir, Side};
 
     use super::*;
+
+    #[test]
+    fn gapped_stream_flood_closes_connection() {
+        let mut s = Recv::new(1 << 20);
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        let result = (0..8192u64).try_for_each(|i| {
+            let data = Bytes::from_static(&[0]);
+            let frame = frame::Stream {
+                id,
+                offset: 1 + 2 * i,
+                fin: false,
+                data,
+            };
+            s.ingest(frame, 1, 0, 1 << 20).map(|_| ())
+        });
+        let err = result.expect_err("gapped flood must be rejected");
+        assert_eq!(err.code, crate::TransportErrorCode::INTERNAL_ERROR);
+    }
 
     #[test]
     fn reordered_frames_while_stopped() {
