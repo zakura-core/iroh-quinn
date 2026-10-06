@@ -1,11 +1,11 @@
 [package]
-name = "noq-proto"
+name = "zakura-noq-proto"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "State machine for the QUIC transport protocol"
+description = "Zakura fork of noq-proto: state machine for the QUIC transport protocol"
 keywords.workspace = true
 categories.workspace = true
 workspace = ".."
@@ -117,3 +117,6 @@ allowed_external_types = [
     "rustls::*",
     "rustls_pki_types::*",
 ]
+
+[lib]
+name = "noq_proto"

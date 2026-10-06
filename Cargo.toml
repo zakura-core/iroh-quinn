@@ -4,11 +4,11 @@ default-members = ["noq", "noq-proto", "noq-udp", "bench", "perf"]
 resolver = "2"
 
 [workspace.package]
-version = "1.2.0"
+version = "1.2.0-zakura.1"
 rust-version = "1.88"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/n0-computer/noq"
+repository = "https://github.com/zakura-core/iroh-quinn"
 keywords = ["quic"]
 categories = ["network-programming", "asynchronous"]
 

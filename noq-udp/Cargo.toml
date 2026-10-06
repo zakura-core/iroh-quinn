@@ -1,11 +1,11 @@
 [package]
-name = "noq-udp"
+name = "zakura-noq-udp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "UDP sockets with ECN information for the QUIC transport protocol"
+description = "Zakura fork of noq-udp: UDP sockets with ECN information for the QUIC transport protocol"
 keywords.workspace = true
 categories.workspace = true
 workspace = ".."
@@ -47,6 +47,7 @@ windows-sys = { workspace = true, features = ["Win32_System_LibraryLoader"] }
 cfg_aliases = { workspace = true }
 
 [lib]
+name = "noq_udp"
 # See https://github.com/bheisler/criterion.rs/blob/master/book/src/faq.md#cargo-bench-gives-unrecognized-option-errors-for-valid-command-line-options
 bench = false
 

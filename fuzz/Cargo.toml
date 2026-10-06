@@ -15,7 +15,7 @@ libfuzzer-sys = "0.4.2"
 [dependencies.proto]
 features = ["arbitrary"]
 path = "../noq-proto"
-package = "noq-proto"
+package = "zakura-noq-proto"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
