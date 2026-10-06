@@ -1,0 +1,65 @@
+# Zakura-only: qualifies the fork stack on GitHub-hosted runners, because the
+# upstream test matrix needs n0's self-hosted runners and never runs on the
+# fork. This branch exists to run this job; it is never merged.
+#
+# Covers SPEC PLAT-1 (Linux x86_64, Linux aarch64, macOS aarch64; macOS x86_64
+# as a bonus) and SEC-7 (the NOQ-1 regression tests pass on every bump).
+name: Zakura fork qualification
+
+on:
+  push:
+    branches: [zakura/macos-qualification]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Upstream noq#797 (after 1.2.0) fixes this seed-dependent test bug: the test
+  # jumps to the earliest timer and sometimes lands on a KeyDiscard timer
+  # instead of the path-idle deadline. The fix touches tests only, so the fork
+  # does not carry it; the qualification skips the test instead.
+  SKIP_FLAKES: --skip tests::multipath::open_path_validation_fails_server_side
+
+jobs:
+  test:
+    name: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - run: uname -a && rustc -Vv
+      # SEC-7: fail if any NOQ-1 regression test is missing or fails.
+      - name: NOQ-1 regression tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p noq-proto --no-default-features --features rustls,ring -- \
+            bounded_chunks_ gapped_crypto_flood_closes_connection gapped_stream_flood_closes_connection \
+            large_initial_token_leaves_room_for_close retired_cid_flood_is_bounded \
+            oversized_cached_initial_token oversized_retry_token 2>&1 | tee proto.log
+          grep -q "test result: ok. 9 passed" proto.log
+          cargo test --locked -p noq-udp recv_single -- --nocapture 2>&1 | tee udp.log
+          grep -q "test result: ok. 2 passed" udp.log
+      - name: noq-udp, default features
+        run: cargo test --locked -p noq-udp
+      - name: noq-udp, fast-apple-datapath (recv_single is its fallback)
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p noq-udp --features fast-apple-datapath
+      - name: noq-proto, Zakura features
+        run: cargo test --locked -p noq-proto --no-default-features --features rustls,ring -- $SKIP_FLAKES
+      - name: noq, Zakura features
+        run: cargo test --locked -p noq --no-default-features --features rustls,ring,runtime-tokio
+      - name: noq, default features
+        run: cargo test --locked -p noq
