@@ -47,25 +47,25 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --locked -p noq-proto --no-default-features --features rustls,ring -- \
+          cargo test --locked -p zakura-noq-proto --no-default-features --features rustls,ring -- \
             bounded_chunks_ gapped_crypto_flood_closes_connection gapped_stream_flood_closes_connection \
             large_initial_token_leaves_room_for_close retired_cid_flood_is_bounded \
             oversized_cached_initial_token oversized_retry_token 2>&1 | tee proto.log
           grep -q "test result: ok. 9 passed" proto.log
-          cargo test --locked -p noq-udp recv_single 2>&1 | tee udp.log
+          cargo test --locked -p zakura-noq-udp recv_single 2>&1 | tee udp.log
           grep -q "test result: ok. 2 passed" udp.log
       - name: noq-udp, default features
-        run: cargo test --locked -p noq-udp
+        run: cargo test --locked -p zakura-noq-udp
       - name: noq-udp, fast-apple-datapath (recv_single is its fallback)
         if: runner.os == 'macOS'
-        run: cargo test --locked -p noq-udp --features fast-apple-datapath
+        run: cargo test --locked -p zakura-noq-udp --features fast-apple-datapath
       # Zakura builds noq with exactly these features (SPEC DEP-3).
       - name: noq-proto, Zakura features
-        run: cargo test --locked -p noq-proto --no-default-features --features rustls,ring -- $SKIP_FLAKES
+        run: cargo test --locked -p zakura-noq-proto --no-default-features --features rustls,ring -- $SKIP_FLAKES
       - name: noq, Zakura features
-        run: cargo test --locked -p noq --no-default-features --features rustls,ring,runtime-tokio
+        run: cargo test --locked -p zakura-noq --no-default-features --features rustls,ring,runtime-tokio
       - name: noq, default features
-        run: cargo test --locked -p noq
+        run: cargo test --locked -p zakura-noq
 
   clippy:
     timeout-minutes: 30
@@ -79,7 +79,7 @@ jobs:
           toolchain: stable
           components: clippy
       - name: Zakura features
-        run: cargo clippy --locked -p noq -p noq-proto -p noq-udp --all-targets --no-default-features --features noq/rustls,noq/ring,noq/runtime-tokio -- -D warnings
+        run: cargo clippy --locked -p zakura-noq -p zakura-noq-proto -p zakura-noq-udp --all-targets --no-default-features --features zakura-noq/rustls,zakura-noq/ring,zakura-noq/runtime-tokio -- -D warnings
       - name: default features
         run: cargo clippy --locked --workspace --exclude fuzz --all-targets -- -D warnings
 
@@ -110,7 +110,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: stable
-      - run: cargo doc --locked -p noq -p noq-proto -p noq-udp --no-deps
+      - run: cargo doc --locked -p zakura-noq -p zakura-noq-proto -p zakura-noq-udp --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
