@@ -1,0 +1,137 @@
+# Zakura's CI for its noq fork. It replaces upstream's workflows, most of which
+# need n0's self-hosted runners or cover platforms Zakura does not ship
+# (Windows, wasm, Android, ESP32, BSDs). SPEC PLAT-1 needs Linux x86_64,
+# Linux aarch64 and macOS aarch64; macOS x86_64 comes free.
+name: Zakura CI
+
+on:
+  pull_request:
+  push:
+    branches: ["zakura/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  # Upstream noq#797 (after 1.2.0) fixes this seed-dependent test bug: the test
+  # jumps to the earliest timer and sometimes lands on a KeyDiscard timer
+  # instead of the path-idle deadline. The fix touches tests only, so the fork
+  # does not carry it.
+  SKIP_FLAKES: --skip tests::multipath::open_path_validation_fails_server_side
+
+jobs:
+  test:
+    name: test (${{ matrix.runner }})
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - run: uname -a && rustc -Vv
+      - name: noq-udp, default features
+        run: cargo test --locked -p noq-udp
+      - name: noq-udp, fast-apple-datapath (recv_single is its fallback)
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p noq-udp --features fast-apple-datapath
+      # Zakura builds noq with exactly these features (SPEC DEP-3).
+      - name: noq-proto, Zakura features
+        run: cargo test --locked -p noq-proto --no-default-features --features rustls,ring -- $SKIP_FLAKES
+      - name: noq, Zakura features
+        run: cargo test --locked -p noq --no-default-features --features rustls,ring,runtime-tokio
+      - name: noq, default features
+        run: cargo test --locked -p noq
+
+  clippy:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Zakura features
+        run: cargo clippy --locked -p noq -p noq-proto -p noq-udp --all-targets --no-default-features --features noq/rustls,noq/ring,noq/runtime-tokio -- -D warnings
+      - name: default features
+        run: cargo clippy --locked --workspace --exclude fuzz --all-targets -- -D warnings
+
+  fmt:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      # Upstream's style, so patches go upstream unchanged (SPEC NOQ-3).
+      - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
+        with:
+          tool: cargo-make
+      - run: cargo make format-check
+
+  docs:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - run: cargo doc --locked -p noq -p noq-proto -p noq-udp --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  deny:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          arguments: --workspace --all-features
+          command: check
+          command-arguments: "-Dwarnings"
+
+  fuzz-build:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      # `cargo fuzz build` takes no --locked: fetch what Cargo.lock names,
+      # then build offline.
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+        env:
+          CARGO_NET_OFFLINE: "true"
