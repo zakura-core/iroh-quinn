@@ -42,6 +42,18 @@ jobs:
         with:
           toolchain: stable
       - run: uname -a && rustc -Vv
+      # SEC-7: fail if any NOQ-1 regression test is missing or fails.
+      - name: NOQ-1 regression tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p noq-proto --no-default-features --features rustls,ring -- \
+            bounded_chunks_ gapped_crypto_flood_closes_connection gapped_stream_flood_closes_connection \
+            large_initial_token_leaves_room_for_close retired_cid_flood_is_bounded \
+            oversized_cached_initial_token oversized_retry_token 2>&1 | tee proto.log
+          grep -q "test result: ok. 9 passed" proto.log
+          cargo test --locked -p noq-udp recv_single 2>&1 | tee udp.log
+          grep -q "test result: ok. 2 passed" udp.log
       - name: noq-udp, default features
         run: cargo test --locked -p noq-udp
       - name: noq-udp, fast-apple-datapath (recv_single is its fallback)
