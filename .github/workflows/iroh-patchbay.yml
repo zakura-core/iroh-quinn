@@ -54,7 +54,7 @@ jobs:
       - name: Install cargo-make and cargo-nextest
         uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
         with:
-          tool: nextest@${{ env.NEXTEST_VERSION }},cargo-make
+          tool: nextest@${{ env.NEXTEST_VERSION }},cargo-make@0.37.24
 
       - name: Patch noq crates in iroh workspace
         working-directory: iroh

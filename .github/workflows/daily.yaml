@@ -44,7 +44,7 @@ jobs:
 
       - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
         with:
-          tool: cargo-make
+          tool: cargo-make@0.37.24
 
       - name: Install sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
@@ -155,7 +155,7 @@ jobs:
           toolchain: stable
       - uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
         with:
-          tool: cargo-hack
+          tool: cargo-hack@0.6.45
       - name: Setup Go (required for aws-lc-rs FIPS)
         if: matrix.os == 'linux'
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
